@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# Build and release artifacts
+build/
+release/
+*.spec.bak
+
+# Runtime data and generated exports
+data/*.sqlite3
+data/*.sqlite3-*
+output/
+tmp/
+
+# Local test sandboxes
+.test-*/
+.test_runtime/
+
+# Merotec IDE and agent-local metadata
+.agents/
+.merotec_attachments/
+.merotec_system_ai/
+
+# Legacy AnyTest/TESTPro reference installation
+anyTestPro2/
+
+# Editors and operating system
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
