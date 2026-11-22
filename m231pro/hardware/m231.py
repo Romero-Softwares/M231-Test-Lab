@@ -120,6 +120,16 @@ def display_unit_frame(unit: str) -> bytes:
     return encode_command(DISPLAY_UNIT_COMMAND, struct.pack("<I", index))
 
 
+def virtual_zero_frame(kind: str) -> bytes:
+    """Monta zeragem somente para a DLL virtual do emulador."""
+    commands = {"position": ord("P"), "force": ord("F")}
+    try:
+        command = commands[kind]
+    except KeyError as error:
+        raise ValueError("Tipo de zeragem virtual invalido.") from error
+    return encode_command(command, b"\x00\x00\x00\x00")
+
+
 def decode_telemetry_frame(frame: bytes) -> M231RawTelemetry:
     """Decodifica o quadro 0x7F de sete blocos recebido continuamente."""
     if frame.endswith(bytes((FRAME_END,))):
@@ -480,6 +490,8 @@ class NativeM231Backend:
             self._telemetry = replace(
                 self._telemetry, position_mm=0.0, displacement_mm=0.0
             )
+            if self.dll_path.name.lower().startswith("virtual_d2xx"):
+                self.transport.write(virtual_zero_frame("position"))
 
     def zero_force(self) -> None:
         self._read_hardware()
@@ -488,6 +500,8 @@ class NativeM231Backend:
                 raise RuntimeError("Nao ha leitura da M231 para zerar a carga.")
             self._load_zero_counts = self._raw.load_counts
             self._telemetry = replace(self._telemetry, force_kn=0.0)
+            if self.dll_path.name.lower().startswith("virtual_d2xx"):
+                self.transport.write(virtual_zero_frame("force"))
 
     def begin_test(self, traction_speed_mm_min: float | None = None) -> None:
         with self._lock:

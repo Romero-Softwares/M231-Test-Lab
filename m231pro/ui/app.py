@@ -1354,6 +1354,14 @@ class TestProLabApp(tk.Tk):
         self._last_checkpoint_monotonic = time.monotonic()
 
     def _remember_physical_checkpoint(self, backend: object) -> None:
+        # Estado capturado durante jog, retorno ou zeragem manual nunca pode
+        # substituir a carga/posicao do ultimo ensaio salvo.
+        if (
+            not getattr(self, "_running", False)
+            or getattr(self, "_result_program", None) is None
+            or not getattr(self, "_current_run_started_at", "")
+        ):
+            return
         """Mantém o último estado físico mesmo entre aquisições do ensaio."""
         capture = getattr(backend, "checkpoint_state", None)
         if not callable(capture):

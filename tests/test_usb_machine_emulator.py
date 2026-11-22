@@ -13,7 +13,12 @@ from usb_machine_emulator.driver_transport import (
     decode_driver_status,
 )
 from usb_machine_emulator.control import MachinePanelController
-from usb_machine_emulator.protocol import CommandDecoder, MachineModel, telemetry_frame
+from usb_machine_emulator.protocol import (
+    CommandDecoder,
+    MachineModel,
+    telemetry_frame,
+    virtual_zero_frame,
+)
 from usb_machine_emulator.shared_transport import PhysicalAndSharedTransport
 
 
@@ -51,6 +56,13 @@ class UsbMachineProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(commands[0][1], 12.5)
         self.assertAlmostEqual(commands[1][1], 12.5)
 
+    def test_decoder_accepts_virtual_zero_commands(self):
+        decoder = CommandDecoder()
+
+        commands = decoder.feed(virtual_zero_frame("position") + virtual_zero_frame("force"))
+
+        self.assertEqual([("P", 0.0), ("F", 0.0)], commands)
+
     def test_machine_model_moves_and_generates_load_after_contact(self):
         model = MachineModel(contact_position_mm=0.5, stiffness_kn_mm=2.0)
         model.apply_command("X", 60.0)
@@ -60,6 +72,22 @@ class UsbMachineProtocolTests(unittest.TestCase):
         decoded = decode_telemetry_frame(model.frame())
         self.assertEqual(decoded.encoder_counts, 100)
         self.assertEqual(decoded.load_counts, 65000)
+
+    def test_panel_applies_software_virtual_zeros_to_machine_model(self):
+        driver = FakePanelDriver()
+        controller = MachinePanelController(driver, synchronization_timeout_s=10.0)
+        controller.start(now=2.0)
+        controller.tick(now=2.05)
+        driver.host_reads_telemetry()
+        controller.tick(now=2.1)
+        controller.model.position_mm = 4.0
+        controller.model.force_kn = 2.0
+        driver.host_writes(virtual_zero_frame("position") + virtual_zero_frame("force"))
+
+        snapshot = controller.tick(now=2.2)
+
+        self.assertEqual(0.0, snapshot.position_mm)
+        self.assertEqual(0.0, snapshot.force_kn)
 
     def test_driver_ioctl_contract_is_stable_and_unique(self):
         values = {

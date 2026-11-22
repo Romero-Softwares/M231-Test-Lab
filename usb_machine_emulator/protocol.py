@@ -8,6 +8,8 @@ import struct
 FRAME_END = 0x0D
 TELEMETRY_COMMAND = 0x7F
 ENCODER_MM_PER_COUNT = 0.01
+VIRTUAL_ZERO_POSITION_COMMAND = ord("P")
+VIRTUAL_ZERO_FORCE_COMMAND = ord("F")
 
 
 def encode_7bit_block(raw: bytes) -> bytes:
@@ -42,6 +44,19 @@ def encode_frame(command: int, payload: bytes) -> bytes:
         for offset in range(0, len(payload), 4)
     )
     return bytes((command,)) + body + bytes((FRAME_END,))
+
+
+def virtual_zero_frame(kind: str) -> bytes:
+    """Monta um comando de zeragem aceito somente pelo emulador USB."""
+    commands = {
+        "position": VIRTUAL_ZERO_POSITION_COMMAND,
+        "force": VIRTUAL_ZERO_FORCE_COMMAND,
+    }
+    try:
+        command = commands[kind]
+    except KeyError as error:
+        raise ValueError("Tipo de zeragem virtual invalido.") from error
+    return encode_frame(command, b"\x00\x00\x00\x00")
 
 
 def telemetry_frame(
@@ -86,9 +101,15 @@ class CommandDecoder:
             end = self._buffer.index(FRAME_END)
             frame = bytes(self._buffer[:end])
             del self._buffer[: end + 1]
-            if len(frame) != 6 or frame[0] not in (ord("0"), ord("X"), ord("U")):
+            if len(frame) != 6 or frame[0] not in (
+                ord("0"), ord("X"), ord("U"),
+                VIRTUAL_ZERO_POSITION_COMMAND, VIRTUAL_ZERO_FORCE_COMMAND,
+            ):
                 continue
             raw = decode_7bit_block(frame[1:])
+            if frame[0] in (VIRTUAL_ZERO_POSITION_COMMAND, VIRTUAL_ZERO_FORCE_COMMAND):
+                commands.append((chr(frame[0]), 0.0))
+                continue
             if frame[0] == ord("U"):
                 unit_index = struct.unpack("<I", raw)[0]
                 if unit_index < 4:

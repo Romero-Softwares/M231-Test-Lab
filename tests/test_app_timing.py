@@ -233,6 +233,25 @@ class TestAppTiming(unittest.TestCase):
         self.assertEqual("1000", app.limit_var.value)
         self.assertEqual("2000,00 N", app.force_var.value)
 
+    def test_manual_machine_state_does_not_replace_test_checkpoint(self):
+        class Backend:
+            def checkpoint_state(self):
+                return {"force_kn": -0.4, "position_mm": -12.0}
+
+        app = TestProLabApp.__new__(TestProLabApp)
+        app._running = False
+        app._last_physical_checkpoint = {
+            "force_kn": 0.8,
+            "position_mm": 25.0,
+        }
+
+        app._remember_physical_checkpoint(Backend())
+
+        self.assertEqual(
+            {"force_kn": 0.8, "position_mm": 25.0},
+            app._last_physical_checkpoint,
+        )
+
     def test_force_unit_selector_converts_target_force(self):
         class Variable:
             def __init__(self, value=""):

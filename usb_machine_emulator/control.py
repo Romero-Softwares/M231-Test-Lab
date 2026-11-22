@@ -127,6 +127,10 @@ class MachinePanelController:
         for channel, speed in commands:
             if channel == "U":
                 self._force_unit = ("N", "kN", "lbf", "kgf")[round(speed)]
+            elif channel == "P":
+                self.model.zero_position()
+            elif channel == "F":
+                self.model.zero_force()
             else:
                 self.model.apply_command(channel, speed)
         if commands:

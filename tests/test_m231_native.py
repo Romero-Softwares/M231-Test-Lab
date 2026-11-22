@@ -91,6 +91,20 @@ class TestM231Protocol(unittest.TestCase):
         decoded = decode_7bit_block(up[1:6])
         self.assertAlmostEqual(-75.5, struct.unpack("<f", decoded)[0])
 
+    def test_virtual_backend_zero_commands_are_sent_only_to_virtual_dll(self):
+        transport = FakeTransport(telemetry_frame(load=1000, encoder=5000))
+        backend = NativeM231Backend(
+            "virtual_d2xx64.dll",
+            calibration=M231Calibration(encoder_mm_per_count=0.01),
+            transport_factory=lambda _path, _settings: transport,
+            connect_timeout_s=0.1,
+        )
+        backend.connect()
+        backend.zero_position()
+        backend.zero_force()
+
+        self.assertEqual([ord("P"), ord("F")], [payload[0] for payload in transport.writes[-2:]])
+
     def test_decodes_fragmented_telemetry(self):
         frame = telemetry_frame(10, 20, 30, 40, 50)
         decoder = M231FrameDecoder()
