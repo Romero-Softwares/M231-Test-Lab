@@ -318,6 +318,11 @@ class PhysicalAndSharedTransport:
         try:
             self._physical.open()
             self._physical_available = True
+            # O processo pode ter terminado sem executar close(). Nesse caso
+            # o UdeCx continua plugado e conserva telemetria/comandos antigos.
+            # Forcar o ciclo plug-out/plug-in cria uma sessao USB limpa antes
+            # de o novo modelo publicar o primeiro quadro.
+            self._physical.plug_out()
             self._physical.plug_in()
         except Exception:
             try:

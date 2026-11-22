@@ -95,6 +95,10 @@ class ResultsRepository:
             }
             if "machine_json" not in columns:
                 connection.execute("ALTER TABLE active_run ADD COLUMN machine_json TEXT")
+            # Migra checkpoints antigos: estado de carga, posicao, offsets e
+            # movimento manual nao pode permanecer armazenado nem ser
+            # reutilizado em uma nova abertura do software.
+            connection.execute("UPDATE active_run SET machine_json = NULL")
 
     def save_run(
         self,
@@ -214,9 +218,10 @@ class ResultsRepository:
                     json.dumps(asdict(program), ensure_ascii=False),
                     json.dumps([asdict(sample) for sample in samples], ensure_ascii=False),
                     elapsed_s,
-                    json.dumps(machine_state, ensure_ascii=False)
-                    if machine_state is not None
-                    else None,
+                    # Estado fisico/manual nunca atravessa uma abertura do
+                    # software. O argumento permanece por compatibilidade,
+                    # mas a base nao grava carga, posicao ou velocidade.
+                    None,
                 ),
             )
 
@@ -236,11 +241,8 @@ class ResultsRepository:
             "program": self._program_from_json(str(row["program_json"])),
             "samples": self._samples_from_json(str(row["samples_json"])),
             "elapsed_s": float(row["elapsed_s"]),
-            "machine_state": (
-                json.loads(str(row["machine_json"]))
-                if row["machine_json"]
-                else None
-            ),
+            # Checkpoints antigos tambem nao podem reintroduzir estado fisico.
+            "machine_state": None,
         }
 
     def clear_checkpoint(self) -> None:

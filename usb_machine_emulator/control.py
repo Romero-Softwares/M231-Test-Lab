@@ -62,6 +62,8 @@ class MachinePanelController:
     def start(self, now: float | None = None) -> None:
         if self._started:
             return
+        # Reabrir o painel no mesmo processo inicia uma maquina virtual limpa.
+        self.model.reset_session()
         self.driver.open()
         try:
             self.driver.plug_in()
@@ -131,6 +133,11 @@ class MachinePanelController:
                 self.model.zero_position()
             elif channel == "F":
                 self.model.zero_force()
+            elif channel == "R":
+                # FT_ResetDevice da DLL virtual inicia uma sessao nova do
+                # emulador; nao basta limpar as filas do transporte porque o
+                # estado fisico simulado vive neste processo.
+                self.model.reset_session()
             else:
                 self.model.apply_command(channel, speed)
         if commands:

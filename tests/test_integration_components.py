@@ -85,6 +85,28 @@ class TestIntegrationComponents(unittest.TestCase):
         self.assertEqual(samples, run.samples)
         self.assertEqual("máquina física", run.mode)
 
+    def test_checkpoint_never_persists_physical_or_manual_machine_state(self):
+        program = compression_return_template()
+        samples = [Sample(0.0, 0.0, 0.0, 0.0, 1, 0, "inicio", True)]
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ResultsRepository(Path(directory) / "results.sqlite3")
+            repository.save_checkpoint(
+                program,
+                samples,
+                "local",
+                "2026-11-22T10:00:00+00:00",
+                machine_state={
+                    "force_kn": 4.5,
+                    "position_mm": 27.0,
+                    "speed_mm_min": 120.0,
+                },
+            )
+
+            checkpoint = repository.get_checkpoint()
+
+        self.assertIsNotNone(checkpoint)
+        self.assertIsNone(checkpoint["machine_state"])
+
     def test_results_repository_deletes_run_and_its_samples(self):
         program = compression_return_template()
         samples = [Sample(0.0, 0.0, 0.0, 0.0, 1, 0, "inicio", True)]

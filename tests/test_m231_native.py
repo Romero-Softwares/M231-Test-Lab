@@ -11,6 +11,7 @@ from m231pro.hardware.m231 import (
     encode_command,
     motion_frames,
 )
+from usb_machine_emulator.protocol import VIRTUAL_POSITION_ZERO_STATUS
 
 
 def telemetry_frame(
@@ -39,6 +40,7 @@ class FakeTransport:
         self.is_open = False
         self.received = bytearray(initial)
         self.writes = []
+        self.virtual_session_resets = 0
 
     def open(self, index=0):
         self.is_open = True
@@ -50,6 +52,9 @@ class FakeTransport:
     def write(self, payload):
         self.writes.append(payload)
         return len(payload)
+
+    def reset_virtual_session(self):
+        self.virtual_session_resets += 1
 
     def read_available(self, maximum=65536):
         data = bytes(self.received[:maximum])
@@ -105,6 +110,18 @@ class TestM231Protocol(unittest.TestCase):
 
         self.assertEqual([ord("P"), ord("F")], [payload[0] for payload in transport.writes[-2:]])
 
+    def test_virtual_backend_starts_a_new_emulator_session_on_connect(self):
+        transport = FakeTransport(telemetry_frame(load=1000, encoder=5000))
+        backend = NativeM231Backend(
+            "virtual_d2xx64.dll",
+            transport_factory=lambda _path, _settings: transport,
+            connect_timeout_s=0.1,
+        )
+
+        backend.connect()
+
+        self.assertEqual(1, transport.virtual_session_resets)
+
     def test_decodes_fragmented_telemetry(self):
         frame = telemetry_frame(10, 20, 30, 40, 50)
         decoder = M231FrameDecoder()
@@ -156,7 +173,7 @@ class TestM231Protocol(unittest.TestCase):
         self.assertEqual(2, len(transport.writes))
         self.assertEqual((ord("0"), ord("X")), tuple(item[0] for item in transport.writes))
 
-    def test_reopen_keeps_nonzero_machine_reading_instead_of_autozeroing_first_frame(self):
+    def test_reopen_autozeroes_first_frame_without_reusing_manual_state(self):
         transport = FakeTransport(telemetry_frame(load=2114, encoder=3200))
         backend = NativeM231Backend(
             "unused.dll",
@@ -168,8 +185,8 @@ class TestM231Protocol(unittest.TestCase):
         backend.connect()
         telemetry = backend.telemetry()
 
-        self.assertAlmostEqual(0.032, telemetry.force_kn, places=3)
-        self.assertAlmostEqual(32.0, telemetry.position_mm, places=5)
+        self.assertAlmostEqual(0.0, telemetry.force_kn, places=3)
+        self.assertAlmostEqual(0.0, telemetry.position_mm, places=5)
 
     def test_checkpoint_blocks_resume_when_real_load_or_position_changed(self):
         transport = FakeTransport(telemetry_frame(load=1000, encoder=5000))
@@ -337,6 +354,47 @@ class TestM231Protocol(unittest.TestCase):
         self.assertEqual(MachineState.IDLE, telemetry.state)
         stop_payload = decode_7bit_block(transport.writes[-2][1:6])
         self.assertEqual(0.0, struct.unpack("<f", stop_payload)[0])
+
+    def test_zero_position_stops_active_motion_and_keeps_display_zero(self):
+        transport = FakeTransport(telemetry_frame(encoder=1000))
+        backend = NativeM231Backend(
+            "unused.dll",
+            calibration=M231Calibration(encoder_mm_per_count=0.01),
+            transport_factory=lambda _path, _settings: transport,
+            connect_timeout_s=0.1,
+        )
+        backend.connect()
+        backend.jog(1, 60.0)
+        backend.zero_position()
+        transport.received.extend(telemetry_frame(encoder=1000))
+
+        telemetry = backend.telemetry()
+
+        self.assertEqual(0.0, telemetry.position_mm)
+        self.assertEqual(MachineState.STOPPED, telemetry.state)
+        self.assertEqual(0.0, backend._commanded_speed)
+
+    def test_virtual_panel_zero_rebases_host_position_reference(self):
+        transport = FakeTransport(telemetry_frame(encoder=-820))
+        backend = NativeM231Backend(
+            "virtual_d2xx64.dll",
+            calibration=M231Calibration(encoder_mm_per_count=0.01),
+            transport_factory=lambda _path, _settings: transport,
+            connect_timeout_s=0.1,
+        )
+        backend.connect()
+        self.assertAlmostEqual(0.0, backend.telemetry().position_mm)
+
+        transport.received.extend(
+            telemetry_frame(
+                encoder=-820,
+                status=(VIRTUAL_POSITION_ZERO_STATUS, 0, 0, 0),
+            )
+        )
+        self.assertEqual(0.0, backend.telemetry().position_mm)
+
+        transport.received.extend(telemetry_frame(encoder=-720))
+        self.assertAlmostEqual(1.0, backend.telemetry().position_mm)
 
     def test_force_limit_stops_machine_in_backend(self):
         transport = FakeTransport(telemetry_frame(load=0, encoder=0))

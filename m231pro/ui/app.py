@@ -1325,64 +1325,20 @@ class TestProLabApp(tk.Tk):
             or not getattr(self, "_current_run_started_at", "")
         ):
             return
-        backend = self.machine.backend
-        machine_state = (
-            backend.checkpoint_state()
-            if callable(getattr(backend, "checkpoint_state", None))
-            else None
-        )
-        # Durante a recuperação o controlador começa localmente enquanto a
-        # conexão USB é restabelecida. Não deixe esse backend temporário
-        # sobrescrever o último estado físico salvo (carga/posição reais).
-        recovered_physical_state = self.__dict__.get("_recovered_physical_state")
-        if recovered_physical_state is not None and not getattr(
-            backend, "is_physical", False
-        ):
-            machine_state = recovered_physical_state
-        if getattr(backend, "is_physical", False) and machine_state is not None:
-            self._last_physical_checkpoint = dict(machine_state)
-            if self.samples:
-                self._recovered_sample = self.samples[-1]
         self.repository.save_checkpoint(
             self._result_program,
             self.samples,
             self.machine.mode_name,
             self._current_run_started_at,
             "pausado" if self._paused else "em execução",
-            machine_state=machine_state,
+            machine_state=None,
         )
         self._last_checkpoint_monotonic = time.monotonic()
 
     def _remember_physical_checkpoint(self, backend: object) -> None:
-        # Estado capturado durante jog, retorno ou zeragem manual nunca pode
-        # substituir a carga/posicao do ultimo ensaio salvo.
-        if (
-            not getattr(self, "_running", False)
-            or getattr(self, "_result_program", None) is None
-            or not getattr(self, "_current_run_started_at", "")
-        ):
-            return
-        """Mantém o último estado físico mesmo entre aquisições do ensaio."""
-        capture = getattr(backend, "checkpoint_state", None)
-        if not callable(capture):
-            return
-        try:
-            state = capture()
-        except (OSError, RuntimeError, TimeoutError, ValueError):
-            return
-        if not isinstance(state, dict):
-            return
-        if state.get("force_kn") is None or state.get("position_mm") is None:
-            return
-        self._last_physical_checkpoint = dict(state)
-        self._recovered_physical_state = dict(state)
-        if (
-            getattr(self, "_running", False)
-            and getattr(self, "_result_program", None) is not None
-            and getattr(self, "_current_run_started_at", "")
-            and time.monotonic() - getattr(self, "_last_checkpoint_monotonic", 0.0) >= 1.0
-        ):
-            self._save_checkpoint()
+        # Checkpoints registram somente o progresso do ensaio. Referencias
+        # fisicas e movimento manual nunca entram na memoria de recuperacao.
+        return
 
     def _recover_checkpoint(self) -> None:
         checkpoint = self.repository.get_checkpoint()
@@ -1425,7 +1381,7 @@ class TestProLabApp(tk.Tk):
         traction_step = next(
             (step for step in program.steps if step.action == "tracao"), None
         )
-        self._recovered_physical_state = checkpoint.get("machine_state")
+        self._recovered_physical_state = None
         self._recovered_sample = samples[-1] if samples else None
         # Se a máquina física já estiver conectada, nenhum movimento pode ser
         # comandado antes de restaurar a carga/posição do checkpoint.
@@ -1458,10 +1414,6 @@ class TestProLabApp(tk.Tk):
                 break
         if samples:
             self._restore_recovered_sample(samples[-1])
-            if not getattr(self.machine.backend, "is_physical", False):
-                restore = getattr(self.machine.backend, "restore_checkpoint", None)
-                if callable(restore):
-                    restore(self._recovered_physical_state)
         self._current_run_started_at = str(checkpoint["started_at"])
         self._started_monotonic = time.monotonic() - elapsed_s
         self._pause_started_monotonic = None
@@ -1498,21 +1450,8 @@ class TestProLabApp(tk.Tk):
     def _resume_physical_checkpoint(self, backend: object) -> bool:
         if not self.__dict__.get("_running", False):
             return True
-        restore = getattr(backend, "restore_checkpoint", None)
         resume = getattr(backend, "resume_test", None)
         sample = getattr(self, "_recovered_sample", None)
-        try:
-            if callable(restore):
-                restore(getattr(self, "_recovered_physical_state", None))
-        except (OSError, RuntimeError, TimeoutError, ValueError) as error:
-            self._paused = True
-            self._running = False
-            self.stage_var.set("RETOMADA BLOQUEADA POR SEGURANÇA")
-            self.status_var.set(
-                f"{error} Nenhum movimento foi comandado; verifique a montagem "
-                "e retome manualmente somente após confirmar a carga."
-            )
-            return False
         if callable(resume) and sample is not None:
             step = next(
                 (item for item in self.program.steps if item.action == sample.action),
@@ -1834,24 +1773,15 @@ class TestProLabApp(tk.Tk):
             if getattr(self.machine.backend, "is_physical", False):
                 self._stop_physical_telemetry()
                 was_running = getattr(self, "_running", False)
-                # Preserve o ensaio congelado ate a M231 voltar e o checkpoint
-                # fisico ser reaplicado; a maquina local nao deve avancar.
+                # Preserve o ensaio congelado ate a M231 voltar; a maquina
+                # local nao deve avancar nem carregar estado fisico anterior.
                 self._paused = was_running
                 self._pause_started_monotonic = (
                     time.monotonic() if was_running else None
                 )
                 if was_running:
                     self._recovered_sample = self.samples[-1] if self.samples else None
-                    saved_state = self.__dict__.get("_last_physical_checkpoint")
-                    if saved_state is not None:
-                        self._recovered_physical_state = dict(saved_state)
-                    elif self._recovered_sample is not None:
-                        sample = self._recovered_sample
-                        self._recovered_physical_state = {
-                            "force_kn": sample.force_kn,
-                            "position_mm": sample.position_mm,
-                            "displacement_mm": sample.displacement_mm,
-                        }
+                    self._recovered_physical_state = None
                 self._return_direction = 0
                 try:
                     self.machine.disconnect()

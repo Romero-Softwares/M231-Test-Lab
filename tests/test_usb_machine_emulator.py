@@ -16,7 +16,9 @@ from usb_machine_emulator.control import MachinePanelController
 from usb_machine_emulator.protocol import (
     CommandDecoder,
     MachineModel,
+    VIRTUAL_POSITION_ZERO_STATUS,
     telemetry_frame,
+    virtual_session_reset_frame,
     virtual_zero_frame,
 )
 from usb_machine_emulator.shared_transport import PhysicalAndSharedTransport
@@ -28,6 +30,35 @@ class UsbMachineProtocolTests(unittest.TestCase):
             transport = PhysicalAndSharedTransport()
 
         self.assertTrue(transport._physical_enabled)
+
+    def test_physical_open_resets_stale_driver_session(self):
+        class FakeChannel:
+            def __init__(self):
+                self.calls = []
+
+            def open(self):
+                self.calls.append("open")
+
+            def close(self):
+                self.calls.append("close")
+
+            def plug_in(self):
+                self.calls.append("plug_in")
+
+            def plug_out(self):
+                self.calls.append("plug_out")
+
+        shared = FakeChannel()
+        physical = FakeChannel()
+        transport = PhysicalAndSharedTransport.__new__(PhysicalAndSharedTransport)
+        transport._shared = shared
+        transport._physical = physical
+        transport._physical_available = False
+        transport._physical_enabled = True
+
+        transport.open()
+
+        self.assertEqual(["open", "plug_out", "plug_in"], physical.calls)
 
     def test_driver_status_accepts_v1_and_v2_contracts(self):
         v1 = decode_driver_status(struct.pack("<IIII", 1, 1, 37, 0))
@@ -63,6 +94,11 @@ class UsbMachineProtocolTests(unittest.TestCase):
 
         self.assertEqual([("P", 0.0), ("F", 0.0)], commands)
 
+    def test_decoder_accepts_virtual_session_reset_command(self):
+        decoder = CommandDecoder()
+
+        self.assertEqual([("R", 0.0)], decoder.feed(virtual_session_reset_frame()))
+
     def test_machine_model_moves_and_generates_load_after_contact(self):
         model = MachineModel(contact_position_mm=0.5, stiffness_kn_mm=2.0)
         model.apply_command("X", 60.0)
@@ -72,6 +108,31 @@ class UsbMachineProtocolTests(unittest.TestCase):
         decoded = decode_telemetry_frame(model.frame())
         self.assertEqual(decoded.encoder_counts, 100)
         self.assertEqual(decoded.load_counts, 65000)
+
+    def test_zero_position_stops_manual_motion_without_resetting_encoder(self):
+        model = MachineModel()
+        model.set_speed(60.0)
+        model.step(2.0)
+
+        model.zero_position()
+        model.step(2.0)
+
+        self.assertEqual(0.0, model.position_mm)
+        self.assertEqual(0.0, model.speed_mm_min)
+        self.assertEqual(200, decode_telemetry_frame(model.frame()).encoder_counts)
+
+    def test_reopened_emulator_discards_position_load_and_manual_speed(self):
+        model = MachineModel()
+        model.set_speed(60.0)
+        model.step(4.0)
+        model.force_kn = 2.5
+
+        model.reset_session()
+
+        self.assertEqual(0.0, model.position_mm)
+        self.assertEqual(0.0, model.encoder_position_mm)
+        self.assertEqual(0.0, model.force_kn)
+        self.assertEqual(0.0, model.speed_mm_min)
 
     def test_panel_applies_software_virtual_zeros_to_machine_model(self):
         driver = FakePanelDriver()
@@ -88,6 +149,35 @@ class UsbMachineProtocolTests(unittest.TestCase):
 
         self.assertEqual(0.0, snapshot.position_mm)
         self.assertEqual(0.0, snapshot.force_kn)
+
+    def test_new_software_session_resets_running_virtual_machine_state(self):
+        driver = FakePanelDriver()
+        controller = MachinePanelController(driver)
+        controller.start(now=1.0)
+        controller.model.position_mm = 9.71
+        controller.model.encoder_position_mm = 9.71
+        controller.model.force_kn = 0.435
+        controller.model.set_speed(120.0)
+        driver.host_writes(virtual_session_reset_frame())
+
+        snapshot = controller.tick(now=1.1)
+
+        self.assertEqual(0.0, snapshot.position_mm)
+        self.assertEqual(0.0, snapshot.force_kn)
+        self.assertEqual(0.0, snapshot.speed_mm_min)
+        self.assertEqual(0.0, controller.model.encoder_position_mm)
+
+    def test_zero_commands_publish_one_shot_telemetry_markers(self):
+        model = MachineModel()
+        model.position_mm = -8.2
+        model.encoder_position_mm = -8.2
+        model.zero_position()
+
+        zero_frame = decode_telemetry_frame(model.frame())
+        next_frame = decode_telemetry_frame(model.frame())
+
+        self.assertEqual(VIRTUAL_POSITION_ZERO_STATUS, zero_frame.status_1)
+        self.assertEqual(0, next_frame.status_1)
 
     def test_driver_ioctl_contract_is_stable_and_unique(self):
         values = {

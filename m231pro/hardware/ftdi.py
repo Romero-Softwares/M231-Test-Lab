@@ -13,6 +13,7 @@ from typing import Protocol
 FT_OK = 0
 FT_PURGE_RX = 1
 FT_PURGE_TX = 2
+VIRTUAL_SESSION_RESET_FRAME = b"R\x80\x80\x80\x80\x80\r"
 PE32_MACHINE = 0x014C
 PE64_MACHINES = {0x8664, 0xAA64}
 VIRTUAL_MAPPING_NAME = "Local\\M231VirtualD2xx"
@@ -521,6 +522,10 @@ class D2xxTransport:
             self._library.FT_Purge(self._handle, FT_PURGE_RX | FT_PURGE_TX),
             "FT_Purge",
         )
+
+    def reset_virtual_session(self) -> None:
+        """Descarta o estado do processo do emulador após abrir a DLL virtual."""
+        self.write(VIRTUAL_SESSION_RESET_FRAME)
 
     def write(self, payload: bytes) -> int:
         if not self.is_open:

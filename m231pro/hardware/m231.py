@@ -11,6 +11,10 @@ from typing import Callable, Protocol
 from m231pro.core.simulation import Sample
 from m231pro.hardware.backend import MachineState, MachineTelemetry
 from m231pro.hardware.ftdi import D2xxConnectionSettings, D2xxTransport
+from usb_machine_emulator.protocol import (
+    VIRTUAL_FORCE_ZERO_STATUS,
+    VIRTUAL_POSITION_ZERO_STATUS,
+)
 
 
 FRAME_END = 0x0D
@@ -206,13 +210,11 @@ class NativeM231Backend:
         self._decoder = M231FrameDecoder()
         self._lock = threading.RLock()
         self._raw: M231RawTelemetry | None = None
-        # A leitura na conexao nao e um comando de zeragem. A controladora
-        # pode permanecer tracionada enquanto o software e reaberto; usar o
-        # primeiro quadro como zero faria a UI perder a carga e o curso reais.
-        # Os botoes de zeragem e o checkpoint continuam podendo substituir
-        # explicitamente estas referencias.
-        self._load_zero_counts: int | None = 0
-        self._position_zero_counts: int | None = 0
+        # As referencias pertencem somente a esta sessao. O primeiro quadro
+        # de cada conexao define os zeros, impedindo que contadores absolutos
+        # remanescentes do emulador/controladora reaparecam acumulados.
+        self._load_zero_counts: int | None = None
+        self._position_zero_counts: int | None = None
         self._return_target_mm: float | None = None
         self._return_direction = 0
         self._commanded_speed = 0.0
@@ -235,7 +237,31 @@ class NativeM231Backend:
         self._received_byte_count = 0
         self._received_preview.clear()
         with self._lock:
+            # Reabrir/reconectar inicia uma sessao limpa: nenhum offset,
+            # alvo de retorno ou velocidade manual atravessa a fronteira.
+            self._raw = None
+            self._load_zero_counts = None
+            self._position_zero_counts = None
+            self._return_target_mm = None
+            self._return_direction = 0
+            self._commanded_speed = 0.0
+            self._telemetry = replace(
+                self._telemetry,
+                timestamp=time.time(),
+                force_kn=0.0,
+                position_mm=0.0,
+                displacement_mm=0.0,
+                state=MachineState.OFFLINE,
+                hardware_connected=False,
+                alarm="",
+            )
             self.transport.open(self.device_index)
+            if self.dll_path.name.lower().startswith("virtual_d2xx"):
+                reset_virtual_session = getattr(
+                    self.transport, "reset_virtual_session", None
+                )
+                if reset_virtual_session is not None:
+                    reset_virtual_session()
         deadline = time.monotonic() + self.connect_timeout_s
         while time.monotonic() < deadline:
             if self._read_hardware():
@@ -315,6 +341,10 @@ class NativeM231Backend:
     def _engineering_values(
         self, raw: M231RawTelemetry
     ) -> tuple[float, float, float]:
+        if raw.status_1 & VIRTUAL_POSITION_ZERO_STATUS:
+            self._position_zero_counts = raw.encoder_counts
+        if raw.status_1 & VIRTUAL_FORCE_ZERO_STATUS:
+            self._load_zero_counts = raw.load_counts
         if self._load_zero_counts is None:
             self._load_zero_counts = raw.load_counts
         if self._position_zero_counts is None:
@@ -486,9 +516,19 @@ class NativeM231Backend:
         with self._lock:
             if self._raw is None:
                 raise RuntimeError("Nao ha leitura da M231 para zerar a posicao.")
+            # Zerar durante jog/retorno deve congelar a máquina na nova
+            # referência; caso contrário a próxima telemetria sobrescreve o
+            # zero e o mostrador volta a deslocar.
+            if self._commanded_speed:
+                self._write_speed(0.0)
+            self._return_target_mm = None
+            self._return_direction = 0
             self._position_zero_counts = self._raw.encoder_counts
             self._telemetry = replace(
-                self._telemetry, position_mm=0.0, displacement_mm=0.0
+                self._telemetry,
+                position_mm=0.0,
+                displacement_mm=0.0,
+                state=MachineState.STOPPED,
             )
             if self.dll_path.name.lower().startswith("virtual_d2xx"):
                 self.transport.write(virtual_zero_frame("position"))
