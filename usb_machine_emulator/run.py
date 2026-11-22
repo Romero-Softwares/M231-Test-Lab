@@ -42,14 +42,14 @@ def main() -> None:
         help="executa sem o display e o controle manual da maquina",
     )
     parser.add_argument(
-        "--legacy-compat",
+        "--compatibility-mode",
         action="store_true",
-        help="identifica o canal virtual como compatibilidade legada",
+        help="identifica o canal virtual como compatibilidade",
     )
     args = parser.parse_args()
     if not 2.0 <= args.period_ms <= 1000.0:
         parser.error("--period-ms deve ficar entre 2 e 1000")
-    compatibility_text = "Software legado" if args.legacy_compat else "M231Pro"
+    compatibility_text = "Modo de compatibilidade" if args.compatibility_mode else "M231Pro"
     if args.headless:
         run(args.period_ms / 1000.0, compatibility_text)
         return

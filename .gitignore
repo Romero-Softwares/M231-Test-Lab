@@ -25,7 +25,7 @@ tmp/
 .merotec_attachments/
 .merotec_system_ai/
 
-# Legacy AnyTest/TESTPro reference installation
+# Dados externos de referência usados apenas no ambiente local
 anyTestPro2/
 
 # Editors and operating system

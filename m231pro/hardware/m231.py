@@ -179,7 +179,7 @@ TransportFactory = Callable[[str | Path, D2xxConnectionSettings], ByteTransport]
 
 
 class NativeM231Backend:
-    """Controle direto da M231 por D2XX, sem processo ou assembly do TESTPro."""
+    """Controle direto da M231 por D2XX, sem processos auxiliares."""
 
     is_physical = True
 

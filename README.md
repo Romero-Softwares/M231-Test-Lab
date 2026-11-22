@@ -85,9 +85,9 @@ importação de métodos, CSV e histórico continuam ativos, e o indicador mostr
 
 **Detectar hardware** faz somente enumeração D2XX. **Conectar máquina** abre a
 FTDI diretamente no processo Python, configura os parâmetros da M231 e exige uma
-telemetria válida antes de habilitar o controle. Nenhum processo PowerShell,
-assembly ou `TESTPro.exe` é iniciado. Movimento, parada, zeragem, retorno,
-aquisição e intertravamentos usam o protocolo binário nativo da controladora.
+telemetria válida antes de habilitar o controle. Movimento, parada, zeragem,
+retorno, aquisição e intertravamentos usam o protocolo binário nativo da
+controladora.
 
 O codec do protocolo, os quadros de movimento, a telemetria fragmentada, a parada
 no alvo, o limite de carga e os fluxos offline são testáveis sem a máquina. A
@@ -125,8 +125,7 @@ powershell -ExecutionPolicy Bypass -File .\build_release.ps1 -Python C:\caminho\
 powershell -ExecutionPolicy Bypass -File .\build_release.ps1 -Python C:\caminho\python-x64\python.exe
 ```
 
-O build valida a presença das quatro DLLs, remove arquivos do programa legado e
-exibe o SHA-256 do ZIP gerado.
+O build valida a presença das quatro DLLs e exibe o SHA-256 do ZIP gerado.
 
 ## Testes automatizados
 

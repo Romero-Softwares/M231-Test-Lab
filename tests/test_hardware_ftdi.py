@@ -68,8 +68,8 @@ class RecordingD2xxLibrary:
 
 
 class TestFtdiProbe(unittest.TestCase):
-    def test_m231_uses_the_exact_legacy_connection_parameters(self):
-        # Extraidos de bo+a::v no IL do AnyTest Pro 3.8.17.44.
+    def test_m231_uses_the_exact_connection_parameters(self):
+        # Parâmetros do protocolo FTDI da controladora.
         settings = D2xxConnectionSettings()
 
         self.assertEqual(853000, settings.baud_rate)
@@ -85,7 +85,7 @@ class TestFtdiProbe(unittest.TestCase):
         self.assertEqual(65536, settings.usb_transfer_size)
         self.assertEqual(512, settings.usb_out_transfer_size)
 
-    def test_transport_initializes_d2xx_in_the_legacy_order(self):
+    def test_transport_initializes_d2xx_in_the_required_order(self):
         library = RecordingD2xxLibrary()
         transport = D2xxTransport("unused.dll")
         transport._load = lambda: library

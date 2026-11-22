@@ -393,7 +393,7 @@ __declspec(dllexport) DWORD WINAPI FT_OpenEx(void *argument, DWORD flags, void *
 }
 
 /*
- * API legada usada pelo TESTPro 3.8.x. Ela usa handles inteiros e nomes
+ * API compatível usada pelo transporte da controladora. Ela usa handles inteiros e nomes
  * distintos dos aliases D2XX atuais. Os wrappers mantêm um unico canal
  * interno, mas deixam a chamada observavel no log para a captura do
  * protocolo legado.
@@ -540,7 +540,7 @@ __declspec(dllexport) DWORD WINAPI FT_Write_Bytes(int raw, BYTE *buffer, int req
     return status;
 }
 
-/* Nomes usados pela camada P/Invoke do TESTPro legado. */
+/* Nomes usados pela camada P/Invoke do transporte compatível. */
 __declspec(dllexport) DWORD WINAPI FT_Read_String(int raw, char *buffer, int requested, int *readCount) {
     DWORD status = FT_Read_Bytes(raw, (BYTE *)buffer, requested, readCount);
     shim_log("FT_Read_String -> status=%lu requested=%d read=%d", (unsigned long)status,

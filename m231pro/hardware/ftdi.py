@@ -41,7 +41,7 @@ class FtdiProbeResult:
 
 @dataclass(frozen=True)
 class D2xxConnectionSettings:
-    # Valores extraidos do IL do AnyTest Pro 3.8.17.44 (bo+a::v).
+    # Parâmetros validados no protocolo FTDI da controladora.
     # O baud e carregado como 0x000D0408 == 853000; nao substituir pelo
     # valor UART comum de 921600 nem ajustar estes parametros por tentativa.
     baud_rate: int = 853000

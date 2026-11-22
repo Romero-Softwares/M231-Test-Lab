@@ -34,11 +34,9 @@ painel novamente. O contrato v3 do driver contabiliza tanto leituras quanto
 escritas do host; drivers antigos continuam decodificaveis, mas devem ser
 atualizados para que os dois softwares tenham a mesma deteccao de atividade.
 
-Por padrao, o emulador atende somente ao M231Pro pelo canal compartilhado. Para
-uma tentativa controlada com o software legado, use `--legacy-compat`. Esse modo
-tambem conecta o driver USB FTDI virtual, entrega os mesmos quadros e comandos
-ao modelo e mostra no painel que a compatibilidade esta ativa. Como a D2XX abre
-uma FT232R com acesso exclusivo, nao abra os dois softwares simultaneamente.
+Por padrao, o emulador atende somente ao M231Pro pelo canal compartilhado. O modo
+`--compatibility-mode` permite validar o transporte compatível. Como a D2XX abre
+uma FT232R com acesso exclusivo, mantenha uma única sessão por vez.
 
 A fila de entrada mantem no maximo um quadro de telemetria aguardando consumo.
 Assim, abrir qualquer um dos programas depois de varios minutos nao entrega um
@@ -94,14 +92,14 @@ Para automacao sem janela, use:
 python -m usb_machine_emulator.run --headless
 ```
 
-Para testar o software legado (somente em uma maquina de teste):
+Para testar o modo de compatibilidade (somente em uma maquina de teste):
 
 ```powershell
-python -m usb_machine_emulator.run --legacy-compat
+python -m usb_machine_emulator.run --compatibility-mode
 ```
 
 Se o teste der errado, encerre o emulador; o modo padrao continua sem o canal
-fisico e nenhuma alteracao no software legado e feita.
+fisico e nenhuma alteracao permanente no sistema e feita.
 
 Ao iniciar, o Gerenciador de Dispositivos deve mostrar o controlador virtual e
 o conversor FTDI. O teste de aceite final e `FT_CreateDeviceInfoList` listar

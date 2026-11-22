@@ -31,8 +31,8 @@ function Build-Shim([string]$Architecture, [string]$Definition, [string]$Destina
 }
 
 # O shim e somente uma ferramenta de diagnostico. Ele nunca pode substituir a
-# D2XX oficial consumida pelo M231Pro. O software legado nao participa da
-# emulacao e nao deve receber a DLL virtual.
+# D2XX oficial consumida pelo M231Pro. A emulação usa somente o protocolo
+# nativo da controladora e não deve receber a DLL virtual.
 Build-Shim "x64" $x64Def (Join-Path $projectRoot "driver\virtual_d2xx64.dll")
 Build-Shim "x86" $x86Def (Join-Path $projectRoot "driver\virtual_d2xx.dll")
 Write-Host "Shims D2XX de diagnostico gerados sem substituir as DLLs FTDI oficiais."

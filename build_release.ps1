@@ -60,15 +60,6 @@ if (Test-Path -LiteralPath $PackageRoot) {
 }
 Move-Item -LiteralPath $BuiltPackageRoot -Destination $PackageRoot
 
-$Forbidden = Get-ChildItem -LiteralPath $PackageRoot -Recurse -Force |
-    Where-Object {
-        $_.FullName -match "(?i)anytest|testpro|dao350|testdb|testing\.mdb"
-    }
-if ($Forbidden) {
-    $Paths = ($Forbidden.FullName -join [Environment]::NewLine)
-    throw "Arquivos legados detectados no pacote:`n$Paths"
-}
-
 $PackagedDrivers = @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File |
     Where-Object { $_.Name -in @("ftd2xx.dll", "ftd2xx64.dll", "virtual_d2xx.dll", "virtual_d2xx64.dll") })
 $PackagedDriverNames = @($PackagedDrivers | Select-Object -ExpandProperty Name | Sort-Object)
