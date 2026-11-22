@@ -13,6 +13,9 @@ from m231pro.core.simulation import (
     compression_return_template,
     force_from_kn,
     force_to_kn,
+    oriented_displacement,
+    traction_pin_template,
+    TractionEngine,
 )
 
 
@@ -71,6 +74,82 @@ class TestSimulationEngine(unittest.TestCase):
         samples = list(SimulationEngine(compression_return_template()).samples())
 
         self.assertTrue(all(sample.force_kn == 0.0 for sample in samples))
+
+    def test_traction_normalizes_target_and_reports_positive_upward_displacement(self):
+        program = traction_pin_template()
+        program.duration_h = 0.001
+        program.acquisition_interval_s = 1.0
+        program.steps[0].target_position_mm = -1.0
+
+        samples = list(SimulationEngine(program).samples())
+
+        self.assertEqual(1.0, samples[-1].position_mm)
+        self.assertEqual(1.0, samples[-1].displacement_mm)
+        self.assertEqual(1.0, oriented_displacement(0.0, 1.0, "tracao"))
+        self.assertEqual(1.0, oriented_displacement(0.0, 1.0, "compressao"))
+
+    def test_traction_returns_to_initial_position_at_test_speed(self):
+        program = traction_pin_template()
+        program.duration_h = 0.001
+        program.acquisition_interval_s = 1.0
+
+        samples = list(TractionEngine(program).samples())
+        return_samples = [sample for sample in samples if sample.action == "descompressao"]
+
+        self.assertTrue(return_samples)
+        self.assertEqual(2, return_samples[0].step)
+        self.assertEqual(program.initial_position_mm, return_samples[-1].position_mm)
+        self.assertAlmostEqual(
+            60.0,
+            return_samples[-1].time_s - program.duration_h * 3600.0,
+            places=6,
+        )
+
+    def test_traction_return_duration_uses_speed_not_acquisition_interval(self):
+        program = traction_pin_template()
+        program.duration_h = 0.001
+        program.acquisition_interval_s = 17.0
+        program.steps[0].speed_mm_min = 2.0
+
+        samples = list(TractionEngine(program).samples())
+        return_samples = [sample for sample in samples if sample.action == "descompressao"]
+
+        self.assertEqual(2, len(return_samples))
+        self.assertAlmostEqual(
+            30.0,
+            return_samples[-1].time_s - program.duration_h * 3600.0,
+            places=6,
+        )
+
+    def test_traction_can_disable_automatic_return(self):
+        program = traction_pin_template()
+        program.duration_h = 0.001
+        program.acquisition_interval_s = 1.0
+        program.auto_return_traction = False
+
+        samples = list(TractionEngine(program).samples())
+
+        self.assertFalse(any(sample.action == "descompressao" for sample in samples))
+        self.assertLessEqual(samples[-1].time_s, program.duration_h * 3600.0)
+
+    def test_traction_resume_during_return_keeps_current_position(self):
+        program = traction_pin_template()
+        program.duration_h = 0.001
+        program.acquisition_interval_s = 1.0
+        program.steps[0].speed_mm_min = 1.0
+        resumed = list(
+            TractionEngine(
+                program,
+                start_elapsed_s=4.0,
+                start_position_mm=0.04,
+            ).samples()
+        )
+
+        self.assertTrue(resumed)
+        self.assertTrue(all(sample.action == "descompressao" for sample in resumed))
+        self.assertGreaterEqual(resumed[0].time_s, 4.0)
+        self.assertLess(resumed[0].position_mm, 0.04)
+        self.assertEqual(program.initial_position_mm, resumed[-1].position_mm)
 
     def test_waits_configured_time_before_decompression(self):
         program = compression_return_template()

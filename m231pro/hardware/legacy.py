@@ -218,7 +218,7 @@ class LegacyOriginalBackend:
     def zero_force(self) -> None:
         self._command("zero_force", MachineState.IDLE)
 
-    def begin_test(self) -> None:
+    def begin_test(self, traction_speed_mm_min: float | None = None) -> None:
         self._command("run", MachineState.RUNNING)
 
     def apply_sample(self, sample: Sample) -> None:

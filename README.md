@@ -47,9 +47,15 @@ driver/                    somente a DLL D2XX necessaria para a FTDI
 Os modulos Python da aplicacao ficam no pacote `m231pro`; somente o ponto de
 entrada permanece na raiz.
 
-O pacote Windows e independente do programa legado. Ele inclui somente
-`driver/ftd2xx64.dll`; executaveis, bancos, relatorios e demais recursos do
-AnyTest/TESTPro nao fazem parte da distribuicao.
+O pacote Windows e independente do programa legado. Ele inclui as DLLs D2XX
+fisica e virtual nas duas arquiteturas (`x86` e `x64`); executaveis, bancos,
+relatorios e demais recursos do AnyTest/TESTPro nao fazem parte da distribuicao.
+
+O TESTPro original foi verificado como x86, assim como sua `FTD2XX.DLL`. Para
+usar o M231Pro no mesmo Windows 32-bit da maquina, o executavel tambem precisa
+ser gerado com Python/PyInstaller x86. O build identifica a arquitetura do
+Python e nomeia o pacote como `Windows-x86` ou `Windows-x64`; incluir uma DLL
+x86 em um executavel x64 nao transforma o aplicativo em x86.
 
 O programa permite:
 

@@ -164,14 +164,61 @@ class LocalMachineBackend:
                 self._telemetry, timestamp=time.time(), force_kn=0.0
             )
 
-    def begin_test(self) -> None:
+    def begin_test(self, traction_speed_mm_min: float | None = None) -> None:
         with self._lock:
             self._velocity_mm_s = 0.0
             self._return_target_absolute_mm = None
+            if traction_speed_mm_min is not None:
+                if traction_speed_mm_min <= 0:
+                    raise ValueError("A velocidade de tracao deve ser maior que zero.")
+                self._velocity_mm_s = traction_speed_mm_min / 60.0
             self._telemetry = replace(
                 self._telemetry,
                 timestamp=time.time(),
                 elapsed_s=0.0,
+                state=MachineState.RUNNING,
+                alarm="",
+            )
+
+    def checkpoint_state(self) -> dict[str, object]:
+        """Guarda a última leitura para uma retomada sem zerar a máquina virtual."""
+        with self._lock:
+            telemetry = self._telemetry
+            return {
+                "checkpoint_version": 1,
+                "force_kn": telemetry.force_kn,
+                "position_mm": telemetry.position_mm,
+                "displacement_mm": telemetry.displacement_mm,
+                "elapsed_s": telemetry.elapsed_s,
+            }
+
+    def restore_checkpoint(self, state: dict[str, object] | None) -> None:
+        """Reaplica a última carga e posição salvas pelo sistema na retomada."""
+        if not state:
+            return
+        with self._lock:
+            force = state.get("force_kn")
+            position = state.get("position_mm")
+            displacement = state.get("displacement_mm", position)
+            if force is None or position is None:
+                return
+            self._telemetry = replace(
+                self._telemetry,
+                timestamp=time.time(),
+                force_kn=float(force),
+                position_mm=float(position),
+                displacement_mm=float(displacement),
+                elapsed_s=float(state.get("elapsed_s", self._telemetry.elapsed_s)),
+            )
+
+    def resume_test(self, sample: Sample, speed_mm_min: float | None) -> None:
+        """Retoma o movimento sem substituir a última leitura por zeros."""
+        with self._lock:
+            if speed_mm_min is not None and abs(speed_mm_min) > 0:
+                self._velocity_mm_s = speed_mm_min / 60.0
+            self._telemetry = replace(
+                self._telemetry,
+                timestamp=time.time(),
                 state=MachineState.RUNNING,
                 alarm="",
             )

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import struct
+import sys
+from ctypes import wintypes
 from typing import Protocol
 
 
@@ -12,6 +15,9 @@ FT_PURGE_RX = 1
 FT_PURGE_TX = 2
 PE32_MACHINE = 0x014C
 PE64_MACHINES = {0x8664, 0xAA64}
+VIRTUAL_MAPPING_NAME = "Local\\M231VirtualD2xx"
+VIRTUAL_MAGIC = 0x3233314D
+VIRTUAL_MODE_ENV = "M231PRO_HARDWARE_MODE"
 
 
 @dataclass(frozen=True)
@@ -105,6 +111,64 @@ def find_compatible_d2xx(root: str | Path) -> Path | None:
         if candidate.is_file() and pe_bitness(candidate) == process_bits:
             return candidate.resolve()
     return None
+
+
+def _virtual_d2xx_is_active() -> bool:
+    """Detecta o canal do emulador sem aceitar um mapeamento abandonado."""
+    if sys.platform != "win32":
+        return False
+    try:
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        kernel32.OpenFileMappingW.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_wchar_p,
+        ]
+        kernel32.OpenFileMappingW.restype = ctypes.c_void_p
+        kernel32.MapViewOfFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_size_t,
+        ]
+        kernel32.MapViewOfFile.restype = ctypes.c_void_p
+        kernel32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        file_map_read = 0x0004
+        process_synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        mapping = kernel32.OpenFileMappingW(
+            file_map_read, False, VIRTUAL_MAPPING_NAME
+        )
+        if not mapping:
+            return False
+        view = kernel32.MapViewOfFile(mapping, file_map_read, 0, 0, 20)
+        try:
+            if not view:
+                return False
+            magic, _version, server_pid, _client_pid, active = ctypes.cast(
+                view, ctypes.POINTER(ctypes.c_uint32 * 5)
+            ).contents
+            if magic != VIRTUAL_MAGIC or not active or not server_pid:
+                return False
+            server = kernel32.OpenProcess(process_synchronize, False, server_pid)
+            if not server:
+                return False
+            try:
+                return kernel32.WaitForSingleObject(server, 0) == wait_timeout
+            finally:
+                kernel32.CloseHandle(server)
+        finally:
+            if view:
+                kernel32.UnmapViewOfFile(view)
+            kernel32.CloseHandle(mapping)
+    except (AttributeError, OSError, ctypes.ArgumentError):
+        return False
 
 
 def _decode_c_string(buffer: ctypes.Array[ctypes.c_char]) -> str:
@@ -220,17 +284,78 @@ def probe_ftdi(dll_path: str | Path) -> FtdiProbeResult:
 
 
 def probe_project_ftdi(driver_root: str | Path) -> FtdiProbeResult:
-    """Localiza a D2XX empacotada com o sistema e executa a sondagem."""
+    """Localiza a D2XX e prioriza sempre uma controladora FTDI física.
+
+    O canal virtual existe somente para testes. Quando ele está ativo ao mesmo
+    tempo que a máquina real, a DLL virtual não pode capturar a conexão da
+    aplicação: a primeira sondagem com dispositivos deve ser a da DLL física.
+    """
     root = Path(driver_root).resolve()
-    dll_path = find_compatible_d2xx(root)
-    if dll_path is None:
-        process_bits = struct.calcsize("P") * 8
+    process_bits = struct.calcsize("P") * 8
+    virtual_path = root / (
+        "virtual_d2xx64.dll"
+        if process_bits == 64
+        else "virtual_d2xx.dll"
+    )
+
+    # O emulador pode estar sustentando um dispositivo USB virtual por um
+    # driver de kernel. Nessa situação, sondar primeiro a D2XX física pode
+    # fazer a enumeração nativa tocar no mesmo stack USB e derrubar o sistema.
+    # O canal virtual é a única fonte segura enquanto o emulador estiver ativo.
+    configured_mode = os.environ.get(VIRTUAL_MODE_ENV, "physical").strip().lower()
+    virtual_active = _virtual_d2xx_is_active()
+    # Em um computador de desenvolvimento, a presença do emulador define o
+    # alvo da sessão automaticamente. Assim os testes virtuais funcionam sem
+    # exigir uma variável de ambiente; no PC da máquina física, sem emulador,
+    # o caminho físico continua sendo o padrão.
+    virtual_mode = configured_mode == "virtual" or virtual_active
+
+    if virtual_mode and virtual_active:
+        if pe_bitness(virtual_path) == process_bits:
+            virtual_result = probe_ftdi(virtual_path)
+            if virtual_result.devices:
+                return virtual_result
+            return FtdiProbeResult(
+                False,
+                (),
+                "Emulador M231 ativo, mas a DLL virtual nao encontrou o dispositivo.",
+                virtual_path,
+            )
         return FtdiProbeResult(
             False,
             (),
-            f"Nenhuma DLL FTDI de {process_bits} bits encontrada em {root}.",
+            "Emulador M231 ativo, mas a DLL virtual nao e compativel com este processo.",
+            virtual_path,
         )
-    return probe_ftdi(dll_path)
+
+    if virtual_active:
+        return FtdiProbeResult(
+            False,
+            (),
+            "Emulador M231 ativo; feche-o antes de conectar a máquina física.",
+            virtual_path,
+        )
+
+    physical_path = find_compatible_d2xx(root)
+    if physical_path is not None:
+        physical_result = probe_ftdi(physical_path)
+        physical_is_virtual_enumeration = bool(physical_result.devices) and all(
+            not device.serial_number and not device.description
+            for device in physical_result.devices
+        )
+        if (
+            physical_result.devices
+            and not physical_is_virtual_enumeration
+        ) or not _virtual_d2xx_is_active():
+            return physical_result
+
+    if physical_path is not None:
+        return probe_ftdi(physical_path)
+    return FtdiProbeResult(
+        False,
+        (),
+        f"Nenhuma DLL FTDI de {process_bits} bits encontrada em {root}.",
+    )
 
 
 class D2xxTransport:

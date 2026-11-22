@@ -76,8 +76,25 @@ class ResultsRepository:
                     acquired INTEGER NOT NULL,
                     PRIMARY KEY (run_id, sequence)
                 );
+                CREATE TABLE IF NOT EXISTS active_run (
+                    slot INTEGER PRIMARY KEY CHECK (slot = 1),
+                    started_at TEXT NOT NULL,
+                    checkpoint_at TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    program_json TEXT NOT NULL,
+                    samples_json TEXT NOT NULL,
+                    elapsed_s REAL NOT NULL,
+                    machine_json TEXT
+                );
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(active_run)")
+            }
+            if "machine_json" not in columns:
+                connection.execute("ALTER TABLE active_run ADD COLUMN machine_json TEXT")
 
     def save_run(
         self,
@@ -128,6 +145,108 @@ class ResultsRepository:
             )
         return run_id
 
+    @staticmethod
+    def _program_from_json(program_json: str) -> TestProgram:
+        data = json.loads(program_json)
+        program = TestProgram(
+            name=str(data["name"]), force_limit_kn=float(data["force_limit_kn"]),
+            force_unit=str(data.get("force_unit", "kN")),
+            position_min_mm=float(data["position_min_mm"]),
+            position_max_mm=float(data["position_max_mm"]),
+            initial_position_mm=float(data["initial_position_mm"]),
+            cycles=int(data["cycles"]),
+            wait_before_decompression_s=float(data.get("wait_before_decompression_s", 0.0)),
+            acquisition_interval_mm=float(data.get("acquisition_interval_mm", 10.0)),
+            steps=[TestStep(**item) for item in data["steps"]],
+            specimen_type=str(data.get("specimen_type", "compressao")),
+            standard=str(data.get("standard", "Procedimento interno")),
+            duration_h=float(data.get("duration_h", 0.0)),
+            acquisition_interval_s=float(data.get("acquisition_interval_s", 60.0)),
+            target_force_kn=float(data.get("target_force_kn", 0.0)),
+            traction_stiffness_kn_mm=float(data.get("traction_stiffness_kn_mm", 1.0)),
+            load_profile=[
+                {"time_s": float(item["time_s"]), "force_kn": float(item["force_kn"])}
+                for item in data.get("load_profile", [])
+            ],
+            auto_return_traction=bool(data.get("auto_return_traction", True)),
+        )
+        program.validate()
+        return program
+
+    @staticmethod
+    def _samples_from_json(samples_json: str) -> list[Sample]:
+        return [Sample(**item) for item in json.loads(samples_json)]
+
+    def save_checkpoint(
+        self,
+        program: TestProgram,
+        samples: list[Sample],
+        mode: str,
+        started_at: str,
+        status: str = "em execução",
+        machine_state: dict[str, object] | None = None,
+    ) -> None:
+        """Persiste o ensaio ativo para sobreviver a queda de energia/processo."""
+        checkpoint_at = datetime.now(timezone.utc).isoformat()
+        elapsed_s = max((float(sample.time_s) for sample in samples), default=0.0)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO active_run
+                    (slot, started_at, checkpoint_at, mode, status,
+                     program_json, samples_json, elapsed_s, machine_json)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(slot) DO UPDATE SET
+                    started_at=excluded.started_at,
+                    checkpoint_at=excluded.checkpoint_at,
+                    mode=excluded.mode,
+                    status=excluded.status,
+                    program_json=excluded.program_json,
+                    samples_json=excluded.samples_json,
+                    elapsed_s=excluded.elapsed_s,
+                    machine_json=excluded.machine_json
+                """,
+                (
+                    started_at,
+                    checkpoint_at,
+                    mode,
+                    status,
+                    json.dumps(asdict(program), ensure_ascii=False),
+                    json.dumps([asdict(sample) for sample in samples], ensure_ascii=False),
+                    elapsed_s,
+                    json.dumps(machine_state, ensure_ascii=False)
+                    if machine_state is not None
+                    else None,
+                ),
+            )
+
+    def get_checkpoint(self) -> dict[str, object] | None:
+        with self._connection() as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM active_run WHERE slot = 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "started_at": str(row["started_at"]),
+            "checkpoint_at": str(row["checkpoint_at"]),
+            "mode": str(row["mode"]),
+            "status": str(row["status"]),
+            "program": self._program_from_json(str(row["program_json"])),
+            "samples": self._samples_from_json(str(row["samples_json"])),
+            "elapsed_s": float(row["elapsed_s"]),
+            "machine_state": (
+                json.loads(str(row["machine_json"]))
+                if row["machine_json"]
+                else None
+            ),
+        }
+
+    def clear_checkpoint(self) -> None:
+        with self._connection() as connection:
+            connection.execute("DELETE FROM active_run WHERE slot = 1")
+
     def recent_runs(self, limit: int = 50) -> list[dict[str, object]]:
         with self._connection() as connection:
             connection.row_factory = sqlite3.Row
@@ -139,6 +258,16 @@ class ResultsRepository:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def latest_run(self) -> StoredRun | None:
+        """Carrega o ensaio salvo mais recentemente, incluindo as amostras."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT id FROM runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return self.get_run(int(row[0]))
 
     def delete_run(self, run_id: int) -> bool:
         """Remove uma execucao e suas amostras vinculadas."""
@@ -184,6 +313,17 @@ class ResultsRepository:
                 data.get("acquisition_interval_mm", 10.0)
             ),
             steps=[TestStep(**item) for item in data["steps"]],
+            specimen_type=str(data.get("specimen_type", "compressao")),
+            standard=str(data.get("standard", "Procedimento interno")),
+            duration_h=float(data.get("duration_h", 0.0)),
+            acquisition_interval_s=float(data.get("acquisition_interval_s", 60.0)),
+            target_force_kn=float(data.get("target_force_kn", 0.0)),
+            traction_stiffness_kn_mm=float(data.get("traction_stiffness_kn_mm", 1.0)),
+            load_profile=[
+                {"time_s": float(item["time_s"]), "force_kn": float(item["force_kn"])}
+                for item in data.get("load_profile", [])
+            ],
+            auto_return_traction=bool(data.get("auto_return_traction", True)),
         )
         samples = [
             Sample(

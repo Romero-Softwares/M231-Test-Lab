@@ -7,24 +7,47 @@ import unittest
 from unittest.mock import patch
 
 from m231pro.ui.app import (
+    HardwareConnectionAttempt,
     TestProLabApp,
     acquired_samples,
     chart_position_marks,
     format_chart_force,
     format_csv_number,
+    format_duration_display,
+    format_elapsed_display,
+    format_stage_status,
     machine_connection_presentation,
     maximize_main_window,
     remaining_delay_ms,
     spaced_chart_marks,
     write_results_csv,
 )
-from m231pro.core.simulation import Sample, compression_return_template
+from m231pro.core.simulation import Sample, TestStep, compression_return_template
 from m231pro.hardware.backend import MachineState
 from m231pro.hardware.backend import MachineTelemetry
 from m231pro.hardware.ftdi import FtdiDevice, FtdiProbeResult
 
 
 class TestAppTiming(unittest.TestCase):
+    def test_stage_status_does_not_show_initial_sample_as_stage_zero(self):
+        self.assertEqual(
+            "Ciclo 1/1 · Início",
+            format_stage_status(1, 1, "inicio", 0),
+        )
+        self.assertEqual(
+            "Ciclo 1/1 · Tração · etapa 1",
+            format_stage_status(1, 1, "tracao", 1),
+        )
+
+    def test_duration_below_one_hour_is_displayed_in_seconds(self):
+        self.assertEqual("30 s", format_duration_display(1 / 120))
+        self.assertEqual("1 h", format_duration_display(1.0))
+
+    def test_elapsed_time_uses_progressive_units(self):
+        self.assertEqual("12,35 s", format_elapsed_display(12.345))
+        self.assertEqual("1 min 05 s", format_elapsed_display(65))
+        self.assertEqual("2 h 03 min 04 s", format_elapsed_display(7384))
+
     def test_run_mode_column_shows_only_online_or_offline(self):
         self.assertEqual(
             "Offline",
@@ -32,7 +55,7 @@ class TestAppTiming(unittest.TestCase):
         )
         self.assertEqual(
             "Online",
-            TestProLabApp._display_run_mode("Controlador M231 FTDI nativo (Python)"),
+            TestProLabApp._display_run_mode("Controlador M231 FTDI nativo (USB)"),
         )
 
     def test_session_delete_stops_current_run_without_deleting_saved_runs(self):
@@ -210,6 +233,31 @@ class TestAppTiming(unittest.TestCase):
         self.assertEqual("1000", app.limit_var.value)
         self.assertEqual("2000,00 N", app.force_var.value)
 
+    def test_force_unit_selector_converts_target_force(self):
+        class Variable:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        app = TestProLabApp.__new__(TestProLabApp)
+        app.force_unit_var = Variable("N")
+        app._displayed_force_unit = "kN"
+        app.limit_var = Variable("1")
+        app.target_force_var = Variable("0,5")
+        app.force_var = Variable()
+        app._last_force_kn = 0.0
+        app._target_force_labels = []
+        app._publish_force_unit = lambda _unit: None
+
+        app._on_force_unit_changed()
+
+        self.assertEqual("500", app.target_force_var.value)
+
     def test_interface_has_no_machine_connection_button(self):
         source = inspect.getsource(TestProLabApp._build_ui)
 
@@ -309,7 +357,7 @@ class TestAppTiming(unittest.TestCase):
         self.assertIsInstance(app.machine.backend, NativeBackend)
         self.assertTrue(app.machine.backend.connected)
         self.assertEqual(2, app.machine.backend.device_index)
-        self.assertIn("automaticamente", app.status_var.value)
+        self.assertEqual("Conex\u00e3o OK", app.status_var.value)
 
     def test_connection_loss_returns_to_local_mode_and_schedules_reconnection(self):
         class Variable:
@@ -357,6 +405,60 @@ class TestAppTiming(unittest.TestCase):
         self.assertIs(app._auto_connect_hardware.__func__, scheduled[0][1].__func__)
         self.assertEqual(500, scheduled[1][0])
 
+    def test_old_telemetry_worker_cannot_inject_error_into_reconnected_session(self):
+        class Variable:
+            def __init__(self):
+                self.value = ""
+
+            def set(self, value):
+                self.value = value
+
+        app = TestProLabApp.__new__(TestProLabApp)
+        app._physical_telemetry_async = True
+        app._telemetry_results = __import__("queue").Queue()
+        app._telemetry_stop = __import__("threading").Event()
+        app._telemetry_thread = None
+        app.machine = type("Machine", (), {"backend": type("Backend", (), {"is_physical": True})()})()
+        app.hardware_var = Variable()
+        app.machine_state_var = Variable()
+        app.status_var = Variable()
+        app.after = lambda _delay, _callback: None
+
+        old_queue = app._telemetry_results
+        app._start_physical_telemetry(type("Backend", (), {"telemetry": lambda _self: None})())
+        old_queue.put(("error", OSError("sessao antiga")))
+
+        self.assertIsNot(old_queue, app._telemetry_results)
+        self.assertTrue(app._physical_telemetry_async)
+
+    def test_failed_connection_does_not_leave_online_indicator(self):
+        class Variable:
+            def __init__(self):
+                self.value = ""
+
+            def set(self, value):
+                self.value = value
+
+        device = FtdiDevice(0, "M231", "Controladora", 0, 0, 0, 0)
+        probe = FtdiProbeResult(
+            True,
+            (device,),
+            "1 dispositivo detectado.",
+            Path("ftd2xx64.dll"),
+        )
+        app = TestProLabApp.__new__(TestProLabApp)
+        app.hardware_var = Variable()
+        app.status_var = Variable()
+
+        connected = app._apply_hardware_connection(
+            HardwareConnectionAttempt(probe, error=RuntimeError("FT_Open falhou")),
+            automatic=True,
+        )
+
+        self.assertFalse(connected)
+        self.assertIn("OFFLINE", app.hardware_var.value)
+        self.assertIn("FT_Open falhou", app.status_var.value)
+
     def test_interface_opens_maximized(self):
         class Window:
             def __init__(self):
@@ -385,8 +487,8 @@ class TestAppTiming(unittest.TestCase):
             FtdiProbeResult(True, (device,), "1 dispositivo detectado.")
         )
 
-        self.assertEqual("MAQUINA ONLINE", label)
-        self.assertIn("nativo em Python", detail)
+        self.assertEqual("Conexão OK", label)
+        self.assertEqual("Conexão OK", detail)
 
     def test_local_run_does_not_require_a_hardware_connection(self):
         class Variable:
@@ -443,6 +545,20 @@ class TestAppTiming(unittest.TestCase):
         self.assertEqual((-12.5, 75.0), app.machine.return_request)
         self.assertIn("-12.5 mm", app.status_var.value)
         self.assertIn("75 mm/min", app.status_var.value)
+
+    def test_program_save_uses_manual_speed_for_the_moving_step(self):
+        class Variable:
+            def get(self):
+                return "1,3"
+
+        app = TestProLabApp.__new__(TestProLabApp)
+        app.manual_speed_var = Variable()
+        steps = [TestStep("tracao", 1.0, 1.0)]
+
+        saved_steps = app._steps_with_manual_speed(steps)
+
+        self.assertEqual(1.3, saved_steps[0].speed_mm_min)
+        self.assertEqual(1.0, steps[0].speed_mm_min)
 
     def test_manual_buttons_show_the_confirmed_motion_direction(self):
         class Button:

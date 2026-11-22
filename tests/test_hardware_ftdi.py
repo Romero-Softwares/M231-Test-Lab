@@ -2,13 +2,17 @@ import struct
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from m231pro.hardware.ftdi import (
     D2xxConnectionSettings,
     D2xxTransport,
+    FtdiDevice,
+    FtdiProbeResult,
     find_compatible_d2xx,
     pe_bitness,
     probe_ftdi,
+    probe_project_ftdi,
 )
 
 
@@ -154,6 +158,113 @@ class TestFtdiProbe(unittest.TestCase):
 
         self.assertIsNotNone(selected)
         self.assertEqual(path.name, selected.name)
+
+    def test_virtual_dll_is_selected_before_physical_probe_when_emulator_is_active(self):
+        process_bits = struct.calcsize("P") * 8
+        machine = 0x8664 if process_bits == 64 else 0x014C
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            physical = root / "ftd2xx64.dll" if process_bits == 64 else root / "ftd2xx.dll"
+            virtual = root / "virtual_d2xx64.dll" if process_bits == 64 else root / "virtual_d2xx.dll"
+            write_minimal_pe(physical, machine)
+            write_minimal_pe(virtual, machine)
+            device = FtdiDevice(0, "REAL-M231", "M231 FTDI", 0, 0, 0, 0)
+
+            probed = []
+
+            def fake_probe(path):
+                probed.append(Path(path).name)
+                if Path(path).name == physical.name:
+                    return FtdiProbeResult(True, (device,), "maquina real", Path(path))
+                return FtdiProbeResult(True, (device,), "emulador", Path(path))
+
+            with patch.dict("os.environ", {"M231PRO_HARDWARE_MODE": "virtual"}), patch(
+                "m231pro.hardware.ftdi._virtual_d2xx_is_active", return_value=True
+            ), patch(
+                "m231pro.hardware.ftdi.probe_ftdi", side_effect=fake_probe
+            ):
+                result = probe_project_ftdi(root)
+
+        self.assertEqual(virtual.name, result.dll_path.name)
+        self.assertEqual((device,), result.devices)
+        self.assertEqual([virtual.name], probed)
+
+    def test_emulator_is_selected_automatically_without_environment_variable(self):
+        process_bits = struct.calcsize("P") * 8
+        machine = 0x8664 if process_bits == 64 else 0x014C
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            physical = root / "ftd2xx64.dll" if process_bits == 64 else root / "ftd2xx.dll"
+            virtual = root / "virtual_d2xx64.dll" if process_bits == 64 else root / "virtual_d2xx.dll"
+            write_minimal_pe(physical, machine)
+            write_minimal_pe(virtual, machine)
+            device = FtdiDevice(0, "A501GR6Y", "M231 virtual", 5, 0, 0, 0)
+
+            def fake_probe(path):
+                if Path(path).name == virtual.name:
+                    return FtdiProbeResult(True, (device,), "emulador", Path(path))
+                raise AssertionError("a DLL fisica nao deve ser sondada com o emulador ativo")
+
+            with patch.dict("os.environ", {}, clear=True), patch(
+                "m231pro.hardware.ftdi._virtual_d2xx_is_active", return_value=True
+            ), patch("m231pro.hardware.ftdi.probe_ftdi", side_effect=fake_probe):
+                result = probe_project_ftdi(root)
+
+        self.assertEqual(virtual.name, result.dll_path.name)
+        self.assertEqual((device,), result.devices)
+
+    def test_virtual_dll_wins_when_physical_dll_has_no_device(self):
+        process_bits = struct.calcsize("P") * 8
+        machine = 0x8664 if process_bits == 64 else 0x014C
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            physical = root / "ftd2xx64.dll" if process_bits == 64 else root / "ftd2xx.dll"
+            virtual = root / "virtual_d2xx64.dll" if process_bits == 64 else root / "virtual_d2xx.dll"
+            write_minimal_pe(physical, machine)
+            write_minimal_pe(virtual, machine)
+            device = FtdiDevice(0, "A501GR6Y", "FT232R USB UART", 5, 0, 0, 0)
+
+            def fake_probe(path):
+                if Path(path).name == physical.name:
+                    return FtdiProbeResult(True, (), "fisica sem dispositivo", Path(path))
+                return FtdiProbeResult(True, (device,), "emulador ativo", Path(path))
+
+            with patch.dict("os.environ", {"M231PRO_HARDWARE_MODE": "virtual"}), patch(
+                "m231pro.hardware.ftdi._virtual_d2xx_is_active", return_value=True
+            ), patch(
+                "m231pro.hardware.ftdi.probe_ftdi", side_effect=fake_probe
+            ):
+                result = probe_project_ftdi(root)
+
+        self.assertEqual(virtual.name, result.dll_path.name)
+        self.assertEqual((device,), result.devices)
+
+    def test_virtual_dll_wins_when_physical_dll_only_sees_anonymous_usb_host(self):
+        process_bits = struct.calcsize("P") * 8
+        machine = 0x8664 if process_bits == 64 else 0x014C
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            physical = root / "ftd2xx64.dll" if process_bits == 64 else root / "ftd2xx.dll"
+            virtual = root / "virtual_d2xx64.dll" if process_bits == 64 else root / "virtual_d2xx.dll"
+            write_minimal_pe(physical, machine)
+            write_minimal_pe(virtual, machine)
+            anonymous = FtdiDevice(0, "", "", 3, 0, 0, 1)
+            device = FtdiDevice(0, "A501GR6Y", "FT232R USB UART", 5, 0, 0, 0)
+
+            def fake_probe(path):
+                if Path(path).name == physical.name:
+                    return FtdiProbeResult(True, (anonymous,), "USB virtual anonimo", Path(path))
+                return FtdiProbeResult(True, (device,), "emulador ativo", Path(path))
+
+            with patch.dict("os.environ", {"M231PRO_HARDWARE_MODE": "virtual"}), patch(
+                "m231pro.hardware.ftdi._virtual_d2xx_is_active", return_value=True
+            ), patch(
+                "m231pro.hardware.ftdi.probe_ftdi", side_effect=fake_probe
+            ):
+                result = probe_project_ftdi(root)
+
+        self.assertEqual(virtual.name, result.dll_path.name)
+        self.assertEqual((device,), result.devices)
 
 
 if __name__ == "__main__":

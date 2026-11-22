@@ -15,6 +15,8 @@ from m231pro.hardware.ftdi import D2xxConnectionSettings, D2xxTransport
 
 FRAME_END = 0x0D
 TELEMETRY_COMMAND = 0x7F
+DISPLAY_UNIT_COMMAND = ord("U")
+DISPLAY_UNITS = ("N", "kN", "lbf", "kgf")
 ADC_FULL_SCALE = 8_388_592.0
 
 
@@ -109,6 +111,15 @@ def motion_frames(speed_mm_min: float) -> tuple[bytes, bytes]:
     return encode_command(ord("0"), payload), encode_command(ord("X"), payload)
 
 
+def display_unit_frame(unit: str) -> bytes:
+    """Monta o quadro de sincronização da unidade exibida pelo painel virtual."""
+    try:
+        index = DISPLAY_UNITS.index(unit)
+    except ValueError as error:
+        raise ValueError(f"Unidade de carga inválida: {unit}") from error
+    return encode_command(DISPLAY_UNIT_COMMAND, struct.pack("<I", index))
+
+
 def decode_telemetry_frame(frame: bytes) -> M231RawTelemetry:
     """Decodifica o quadro 0x7F de sete blocos recebido continuamente."""
     if frame.endswith(bytes((FRAME_END,))):
@@ -185,12 +196,19 @@ class NativeM231Backend:
         self._decoder = M231FrameDecoder()
         self._lock = threading.RLock()
         self._raw: M231RawTelemetry | None = None
-        self._load_zero_counts: int | None = None
-        self._position_zero_counts: int | None = None
+        # A leitura na conexao nao e um comando de zeragem. A controladora
+        # pode permanecer tracionada enquanto o software e reaberto; usar o
+        # primeiro quadro como zero faria a UI perder a carga e o curso reais.
+        # Os botoes de zeragem e o checkpoint continuam podendo substituir
+        # explicitamente estas referencias.
+        self._load_zero_counts: int | None = 0
+        self._position_zero_counts: int | None = 0
         self._return_target_mm: float | None = None
         self._return_direction = 0
         self._commanded_speed = 0.0
         self._paused_speed = 0.0
+        self._traction_target_force_kn: float | None = None
+        self._traction_target_reached = False
         self._last_plan_sample: Sample | None = None
         self._last_frame_monotonic = 0.0
         self._received_byte_count = 0
@@ -200,7 +218,7 @@ class NativeM231Backend:
 
     @property
     def mode_name(self) -> str:
-        return "Controlador M231 FTDI nativo (Python)"
+        return "Controlador M231 FTDI nativo (USB)"
 
     def connect(self) -> None:
         self._decoder = M231FrameDecoder()
@@ -262,6 +280,19 @@ class NativeM231Backend:
             raise ValueError("O limite de carga deve ser maior que zero.")
         with self._lock:
             self.force_limit_kn = force_limit_kn
+
+    def configure_target_force(self, target_force_kn: float | None) -> None:
+        if target_force_kn is not None and target_force_kn < 0:
+            raise ValueError("A carga-alvo nao pode ser negativa.")
+        with self._lock:
+            self._traction_target_force_kn = target_force_kn
+            self._traction_target_reached = False
+
+    def set_display_unit(self, unit: str) -> None:
+        """Sincroniza a unidade do painel sem alterar a unidade interna kN."""
+        with self._lock:
+            if self.transport.is_open:
+                self.transport.write(display_unit_frame(unit))
 
     def _write_speed(self, speed_mm_min: float) -> None:
         if not self.transport.is_open:
@@ -337,6 +368,20 @@ class NativeM231Backend:
             if abs(telemetry.force_kn) > self.force_limit_kn:
                 self.emergency_stop(
                     f"Limite de carga excedido: {telemetry.force_kn:.3f} kN"
+                )
+                return self._telemetry
+            if (
+                self._traction_target_force_kn is not None
+                and self._commanded_speed > 0
+                and telemetry.force_kn >= self._traction_target_force_kn
+            ):
+                self._write_speed(0.0)
+                self._traction_target_reached = True
+                self._telemetry = replace(
+                    self._telemetry,
+                    timestamp=time.time(),
+                    state=MachineState.RUNNING,
+                    alarm="Carga-alvo atingida; tracao mantida.",
                 )
                 return self._telemetry
             upper_limit_reached = (
@@ -444,15 +489,176 @@ class NativeM231Backend:
             self._load_zero_counts = self._raw.load_counts
             self._telemetry = replace(self._telemetry, force_kn=0.0)
 
-    def begin_test(self) -> None:
+    def begin_test(self, traction_speed_mm_min: float | None = None) -> None:
         with self._lock:
             if self._alarm_latched:
                 raise RuntimeError("Alarme travado; reconecte a M231 apos verificar a maquina.")
             self._last_plan_sample = None
+            self._traction_target_reached = False
+            if traction_speed_mm_min is not None:
+                if traction_speed_mm_min <= 0:
+                    raise ValueError("A velocidade de tracao deve ser maior que zero.")
+                self._write_speed(traction_speed_mm_min)
             self._telemetry = replace(
                 self._telemetry,
                 timestamp=time.time(),
                 elapsed_s=0.0,
+                state=MachineState.RUNNING,
+                alarm="",
+            )
+
+    def checkpoint_state(self) -> dict[str, object]:
+        """Retorna referências físicas necessárias para retomar após reconexão."""
+        self._read_hardware()
+        with self._lock:
+            force = position = displacement = None
+            if self._raw is not None:
+                force, position, displacement = self._engineering_values(self._raw)
+            return {
+                "checkpoint_version": 2,
+                "position_zero_counts": self._position_zero_counts,
+                "load_zero_counts": self._load_zero_counts,
+                "raw_encoder_counts": (
+                    self._raw.encoder_counts if self._raw is not None else None
+                ),
+                "raw_load_counts": (
+                    self._raw.load_counts if self._raw is not None else None
+                ),
+                "force_kn": force,
+                "position_mm": position,
+                "displacement_mm": displacement,
+                "captured_at": time.time(),
+            }
+
+    def restore_checkpoint(self, state: dict[str, object] | None) -> None:
+        """Restaura os zeros absolutos sem fabricar uma leitura de carga/posição."""
+        if not state:
+            return
+        self._read_hardware()
+        with self._lock:
+            if self._raw is None:
+                raise RuntimeError("Nao ha telemetria para restaurar o ensaio M231.")
+            position_zero = state.get("position_zero_counts")
+            load_zero = state.get("load_zero_counts")
+            saved_load = state.get("raw_load_counts")
+            saved_encoder = state.get("raw_encoder_counts")
+            if position_zero is not None:
+                self._position_zero_counts = int(position_zero)
+            if load_zero is not None:
+                self._load_zero_counts = int(load_zero)
+            force, position, displacement = self._engineering_values(self._raw)
+            expected_force = state.get("force_kn")
+            expected_position = state.get("position_mm")
+            if expected_force is None and expected_position is None:
+                if saved_load is not None and saved_encoder is not None:
+                    load_delta = int(saved_load) - int(self._load_zero_counts or 0)
+                    adjustment = (
+                        self.calibration.load_adjustment_positive
+                        if load_delta >= 0
+                        else self.calibration.load_adjustment_negative
+                    )
+                    expected_force = (
+                        load_delta
+                        / ADC_FULL_SCALE
+                        * self.calibration.adc_headroom
+                        * self.calibration.load_capacity_kn
+                        * adjustment
+                    )
+                    expected_position = (
+                        (int(saved_encoder) - int(self._position_zero_counts or 0))
+                        * self.calibration.encoder_mm_per_count
+                        * self.calibration.position_direction
+                    )
+            if expected_force is not None and expected_position is not None:
+                force_tolerance = max(0.05, abs(float(expected_force)) * 0.05)
+                position_tolerance = max(0.05, self.calibration.encoder_mm_per_count * 2)
+                # A controladora reiniciada pode devolver zero (ou poucos
+                # counts) mesmo com o corpo ainda tracionado. Essa detecção
+                # precisa ocorrer antes da tolerância: 32 N = 0,032 kN e a
+                # tolerância mínima de 0,05 kN não pode transformar o reset
+                # em uma leitura válida.
+                counters_were_reset = (
+                    (saved_load is not None
+                     and abs(int(self._raw.load_counts)) <= 1000
+                     and abs(int(saved_load)) > 1000)
+                    or (saved_encoder is not None
+                        and abs(int(self._raw.encoder_counts)) <= 1000
+                        and abs(int(saved_encoder)) > 1000)
+                )
+                if counters_were_reset:
+                    if saved_load is not None and abs(int(self._raw.load_counts)) <= 1000:
+                        target_delta = self._load_delta_for_force(float(expected_force))
+                        self._load_zero_counts = int(self._raw.load_counts) - target_delta
+                    if saved_encoder is not None and abs(int(self._raw.encoder_counts)) <= 1000:
+                        target_counts = round(
+                            float(expected_position)
+                            / self.calibration.encoder_mm_per_count
+                            / self.calibration.position_direction
+                        )
+                        self._position_zero_counts = int(self._raw.encoder_counts) - target_counts
+                    force, position, displacement = self._engineering_values(self._raw)
+                elif (
+                    abs(force - float(expected_force)) > force_tolerance
+                    or abs(position - float(expected_position)) > position_tolerance
+                ):
+                    self._write_speed(0.0)
+                    self._telemetry = replace(
+                        self._telemetry,
+                        timestamp=time.time(),
+                        force_kn=force,
+                        position_mm=position,
+                        displacement_mm=displacement,
+                        state=MachineState.PAUSED,
+                        alarm="Retomada bloqueada: carga/posicao divergente do checkpoint",
+                        hardware_connected=True,
+                    )
+                    raise RuntimeError(
+                        "Retomada bloqueada por seguranca: a carga ou a posicao "
+                        "reais nao coincidem com o ultimo checkpoint. "
+                        "Verifique o pino/mola antes de continuar."
+                    )
+            self._telemetry = replace(
+                self._telemetry,
+                timestamp=time.time(),
+                force_kn=force,
+                position_mm=position,
+                displacement_mm=displacement,
+                hardware_connected=True,
+            )
+            # A controladora reiniciada pode voltar com os contadores em zero
+            # enquanto a celula continua tracionada. A carga e a posicao do
+            # checkpoint sao reapresentadas antes de qualquer movimento.
+            if (
+                self._traction_target_force_kn is not None
+                and force >= self._traction_target_force_kn
+            ):
+                self._traction_target_reached = True
+
+    def _load_delta_for_force(self, force_kn: float) -> int:
+        adjustment = (
+            self.calibration.load_adjustment_positive
+            if force_kn >= 0
+            else self.calibration.load_adjustment_negative
+        )
+        return round(
+            force_kn
+            / self.calibration.adc_headroom
+            / self.calibration.load_capacity_kn
+            / adjustment
+            * ADC_FULL_SCALE
+        )
+
+    def resume_test(self, sample: Sample, speed_mm_min: float | None) -> None:
+        """Rearma a etapa interrompida mantendo a posição real da máquina."""
+        with self._lock:
+            self._last_plan_sample = sample
+            if self._traction_target_reached:
+                self._write_speed(0.0)
+            elif speed_mm_min is not None and abs(speed_mm_min) > 0:
+                self._write_speed(speed_mm_min)
+            self._telemetry = replace(
+                self._telemetry,
+                timestamp=time.time(),
                 state=MachineState.RUNNING,
                 alarm="",
             )
@@ -464,7 +670,19 @@ class NativeM231Backend:
                 return
             previous = self._last_plan_sample
             self._last_plan_sample = sample
-            desired_speed = 0.0
+            desired_speed = (
+                self._commanded_speed
+                if previous is None or sample.action == "tracao"
+                else 0.0
+            )
+            if self._traction_target_reached and sample.action == "tracao":
+                desired_speed = 0.0
+            # A velocidade da tracao e um parametro do programa, nao uma
+            # velocidade calculada entre aquisicoes. Como o intervalo pode
+            # ser muito maior que o tempo de movimento, usar os pontos da
+            # amostra aqui faria 1,3 mm/min, por exemplo, virar 1,0 mm/min.
+            # O comando enviado no inicio da tracao deve permanecer ativo ate
+            # a carga-alvo, quebra, limite ou parada de seguranca.
             if previous is not None and sample.action in ("compressao", "descompressao"):
                 delta_time = sample.time_s - previous.time_s
                 if delta_time > 1e-9:

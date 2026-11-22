@@ -4,7 +4,12 @@
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[('driver\\ftd2xx64.dll', 'driver')],
+    binaries=[
+        ('driver\\ftd2xx.dll', 'driver'),
+        ('driver\\ftd2xx64.dll', 'driver'),
+        ('driver\\virtual_d2xx.dll', 'driver'),
+        ('driver\\virtual_d2xx64.dll', 'driver'),
+    ],
     datas=[('assets\\m231pro-icon.ico', 'assets')],
     hiddenimports=[],
     hookspath=[],

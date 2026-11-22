@@ -4,6 +4,7 @@ import csv
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import json
 import math
 from pathlib import Path
 import queue
@@ -12,7 +13,13 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from m231pro.config import APP_ICON, DRIVER_ROOT, PROJECT_ROOT, RESULTS_DATABASE
+from m231pro.config import (
+    APP_ICON,
+    DRIVER_ROOT,
+    LAST_IMPORTED_PROGRAM,
+    PROJECT_ROOT,
+    RESULTS_DATABASE,
+)
 from m231pro.core.reporting import generate_run_report_pdf, report_filename
 from m231pro.core.storage import ResultsRepository
 from m231pro.hardware.backend import LocalMachineBackend, MachineController, MachineState
@@ -23,17 +30,24 @@ from m231pro.core.simulation import (
     FORCE_UNITS,
     Sample,
     SimulationEngine,
+    TractionEngine,
+    SPECIMEN_TYPES,
     TestProgram,
     TestStep,
     compression_return_template,
     cyclic_template,
+    traction_pin_template,
+    traction_spring_template,
     force_from_kn,
     force_to_kn,
+    motion_target_position,
+    oriented_displacement,
 )
 
 
 ACTION_LABELS = {
     "compressao": "Compressão",
+    "tracao": "Tração",
     "descompressao": "Descompressão/retorno",
     "manter": "Manter posição",
     "aguardar_descompressao": "Espera antes da descompressão",
@@ -73,10 +87,7 @@ def machine_connection_presentation(
 ) -> tuple[str, str]:
     """Separa o estado da maquina da disponibilidade do sistema local."""
     if result is not None and result.devices:
-        return (
-            "MAQUINA ONLINE",
-            f"{result.message} Controle M231 nativo em Python disponivel para conexao.",
-        )
+        return ("Conex\u00e3o OK", "Conex\u00e3o OK")
 
     diagnostic = result.message if result is not None else "Nenhuma maquina conectada."
     return (
@@ -96,6 +107,39 @@ def format_csv_number(value: float) -> str:
     if abs(rounded) < 1e-12:
         rounded = 0.0
     return f"{rounded:.6f}".rstrip("0").rstrip(".")
+
+
+def format_duration_display(duration_h: float) -> str:
+    """Exibe durações curtas em segundos e as demais em horas."""
+    duration_h = float(duration_h)
+    if 0 <= duration_h < 1:
+        return f"{format_csv_number(duration_h * 3600.0)} s"
+    return f"{format_csv_number(duration_h)} h"
+
+
+def format_elapsed_display(elapsed_s: float) -> str:
+    """Exibe o tempo do ensaio com unidades progressivas e legíveis."""
+    total_seconds = max(0.0, float(elapsed_s))
+    if total_seconds < 60.0:
+        return f"{total_seconds:.2f} s".replace(".", ",")
+
+    total_whole_seconds = int(total_seconds)
+    seconds = total_whole_seconds % 60
+    total_minutes = total_whole_seconds // 60
+    if total_minutes < 60:
+        return f"{total_minutes} min {seconds:02d} s"
+
+    minutes = total_minutes % 60
+    hours = total_minutes // 60
+    return f"{hours} h {minutes:02d} min {seconds:02d} s"
+
+
+def format_stage_status(cycle: int, cycles: int, action: str, step: int) -> str:
+    """Exibe o estado sem tratar a amostra inicial como etapa programada."""
+    status = f"Ciclo {cycle}/{cycles} · {ACTION_LABELS.get(action, 'Início')}"
+    if action == "inicio" or step <= 0:
+        return status
+    return f"{status} · etapa {step}"
 
 
 def format_force(value_kn: float, unit: str = "kN", decimals: int | None = None) -> str:
@@ -175,8 +219,7 @@ def write_results_csv(
     force_column = f"carga_{force_unit.lower()}"
     with open(path, "w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle, delimiter=";")
-        writer.writerow(
-            [
+        headers = [
                 "tempo_s",
                 "delta_tempo_s",
                 force_column,
@@ -189,8 +232,15 @@ def write_results_csv(
                 "acao",
                 "intervalo_aquisicao_configurado_mm",
                 "espera_configurada_s",
+        ]
+        if program.specimen_type != "compressao":
+            headers[11:11] = [
+                "tipo_corpo_de_prova",
+                "norma_procedimento",
+                "duracao_configurada_h",
+                "intervalo_aquisicao_configurado_s",
             ]
-        )
+        writer.writerow(headers)
         previous: Sample | None = None
         for sample in samples_to_export:
             delta_time = sample.time_s - previous.time_s if previous else 0.0
@@ -200,8 +250,7 @@ def write_results_csv(
                 if delta_time > 1e-12
                 else 0.0
             )
-            writer.writerow(
-                [
+            values = [
                     format_csv_number(sample.time_s),
                     format_csv_number(delta_time),
                     format_csv_number(force_from_kn(sample.force_kn, force_unit)),
@@ -214,8 +263,15 @@ def write_results_csv(
                     sample.action,
                     format_csv_number(program.acquisition_interval_mm),
                     format_csv_number(program.wait_before_decompression_s),
+            ]
+            if program.specimen_type != "compressao":
+                values[11:11] = [
+                    program.specimen_type,
+                    program.standard,
+                    format_csv_number(program.duration_h),
+                    format_csv_number(program.acquisition_interval_s),
                 ]
-            )
+            writer.writerow(values)
             previous = sample
 
 
@@ -228,6 +284,12 @@ class TestProLabApp(tk.Tk):
         self.minsize(1040, 650)
         maximize_main_window(self)
         self.program = compression_return_template()
+        try:
+            if LAST_IMPORTED_PROGRAM.exists():
+                self.program = TestProgram.load(LAST_IMPORTED_PROGRAM)
+        except (OSError, ValueError, KeyError, TypeError):
+            # Um arquivo persistido inválido não impede a abertura do software.
+            self.program = compression_return_template()
         self.samples: list[Sample] = []
         self._result_program: TestProgram | None = None
         self._engine: SimulationEngine | None = None
@@ -235,11 +297,14 @@ class TestProLabApp(tk.Tk):
         self._pending_sample: Sample | None = None
         self._started_monotonic = 0.0
         self._pause_started_monotonic: float | None = None
+        self._clock_job: str | None = None
+        self._chart_job: str | None = None
         self._running = False
         self._paused = False
         self._return_direction = 0
         self._last_machine_position: float | None = None
         self._last_force_kn = 0.0
+        self._live_chart_sample: Sample | None = None
         self._last_machine_state: MachineState | None = None
         self._steps_window: tk.Toplevel | None = None
         self.tree: ttk.Treeview | None = None
@@ -251,6 +316,10 @@ class TestProLabApp(tk.Tk):
         self._connection_thread: threading.Thread | None = None
         self._connection_results: queue.Queue[HardwareConnectionAttempt] = queue.Queue()
         self._connection_cancelled = threading.Event()
+        self._telemetry_results: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._telemetry_stop = threading.Event()
+        self._telemetry_thread: threading.Thread | None = None
+        self._physical_telemetry_async = False
         self._closing = False
         self.machine = MachineController()
         self.repository = ResultsRepository(RESULTS_DATABASE)
@@ -258,6 +327,7 @@ class TestProLabApp(tk.Tk):
         self._build_ui()
         self._load_program_to_ui()
         self.protocol("WM_DELETE_WINDOW", self._close_app)
+        self.after(0, self._recover_checkpoint)
         self.after(100, self._poll_machine)
         self.status_var.set("Procurando a máquina automaticamente...")
         self._schedule_auto_connect(AUTO_CONNECT_INITIAL_DELAY_MS)
@@ -335,6 +405,11 @@ class TestProLabApp(tk.Tk):
             text="Detectar hardware",
             command=self._probe_hardware,
         ).pack(side="left", padx=4)
+        ttk.Button(
+            toolbar,
+            text="Configurações do ensaio",
+            command=self._show_test_settings,
+        ).pack(side="left", padx=4)
         connection_label, _connection_detail = machine_connection_presentation(None)
         self.hardware_var = tk.StringVar(value=connection_label)
         hardware_terminal = tk.Frame(
@@ -384,6 +459,14 @@ class TestProLabApp(tk.Tk):
         self.cycles_var = tk.StringVar()
         self.wait_before_return_var = tk.StringVar()
         self.acquisition_interval_var = tk.StringVar()
+        self.specimen_type_var = tk.StringVar(value="compressao")
+        self.standard_var = tk.StringVar()
+        self.duration_h_var = tk.StringVar()
+        self.acquisition_interval_s_var = tk.StringVar()
+        self.target_force_var = tk.StringVar()
+        self._target_force_labels = []
+        self.load_profile_var = tk.StringVar()
+        self.auto_return_traction_var = tk.BooleanVar(value=True)
         field_rows = (
             (
                 ("Nome", self.name_var, 28),
@@ -419,6 +502,48 @@ class TestProLabApp(tk.Tk):
                     editor = ttk.Entry(field, textvariable=variable, width=width)
                 editor.pack(anchor="w", pady=(1, 0))
 
+        traction_row = ttk.Frame(settings)
+        traction_row.grid(row=2, column=0, sticky="w")
+        for label, variable, width in (
+            ("Corpo de prova", self.specimen_type_var, 16),
+            ("Norma/procedimento", self.standard_var, 34),
+            ("Duracao (h)", self.duration_h_var, 9),
+            ("Aquisicao temporal (s)", self.acquisition_interval_s_var, 9),
+            ("Carga-alvo (kN)", self.target_force_var, 10),
+            ("Perfil JSON [{time_s,force_kn}]", self.load_profile_var, 36),
+        ):
+            field = ttk.Frame(traction_row)
+            field.pack(side="left", anchor="n", padx=(0, 12), pady=(0, 5))
+            label_widget = ttk.Label(
+                field,
+                text=(
+                    f"Carga-alvo ({self.force_unit_var.get()})"
+                    if variable is self.target_force_var
+                    else label
+                ),
+            )
+            label_widget.pack(anchor="w")
+            if variable is self.target_force_var:
+                self._target_force_labels.append(label_widget)
+            if variable is self.specimen_type_var:
+                editor = ttk.Combobox(field, textvariable=variable, values=SPECIMEN_TYPES, state="readonly", width=width)
+            else:
+                editor = ttk.Entry(field, textvariable=variable, width=width)
+            editor.pack(anchor="w", pady=(1, 0))
+
+        settings.pack_forget()
+        settings_summary = ttk.LabelFrame(left, text="Configuração atual", padding=8)
+        settings_summary.pack(fill="x")
+        self.settings_summary_var = tk.StringVar()
+        ttk.Label(settings_summary, textvariable=self.settings_summary_var, justify="left").pack(
+            side="left", fill="x", expand=True
+        )
+        ttk.Button(
+            settings_summary,
+            text="Abrir configurações",
+            command=self._show_test_settings,
+        ).pack(side="right", padx=(10, 0))
+
         presets = ttk.Frame(left, padding=(0, 8))
         presets.pack(fill="x")
         ttk.Label(presets, text="Modelos:").pack(side="left")
@@ -432,6 +557,8 @@ class TestProLabApp(tk.Tk):
             text="Cíclico",
             command=lambda: self._apply_template(cyclic_template()),
         ).pack(side="left", padx=5)
+        ttk.Button(presets, text="Tracao pino", command=lambda: self._apply_template(traction_pin_template())).pack(side="left", padx=5)
+        ttk.Button(presets, text="Tracao mola", command=lambda: self._apply_template(traction_spring_template())).pack(side="left", padx=5)
         self.steps_button_var = tk.StringVar(value="Etapas programadas")
         ttk.Button(
             presets,
@@ -625,6 +752,166 @@ class TestProLabApp(tk.Tk):
         program = self.__dict__.get("program")
         return program.force_unit if program is not None else "kN"
 
+    def _show_test_settings(self) -> None:
+        window = getattr(self, "_settings_window", None)
+        if window is not None and window.winfo_exists():
+            window.deiconify()
+            window.lift()
+            window.focus_force()
+            return
+
+        window = tk.Toplevel(self)
+        self._settings_window = window
+        window.title("Configurações do ensaio")
+        window.geometry("980x500")
+        window.minsize(820, 420)
+        window.transient(self)
+        window.protocol("WM_DELETE_WINDOW", self._close_test_settings)
+        apply_application_icon(window)
+
+        content = ttk.Frame(window, padding=12)
+        content.pack(fill="both", expand=True)
+        ttk.Label(
+            content,
+            text="Parâmetros do programa, corpo de prova e aquisição de longa duração.",
+            foreground="#555",
+        ).pack(anchor="w", pady=(0, 8))
+
+        general = ttk.LabelFrame(content, text="Identificação e limites", padding=8)
+        general.pack(fill="x", pady=(0, 8))
+        general_fields = (
+            ("Nome", self.name_var, 30),
+            ("Limite de segurança", self.limit_var, 12),
+            ("Unidade", self.force_unit_var, 7),
+            ("Posição inicial (mm)", self.initial_var, 12),
+            ("Posição mínima (mm)", self.min_position_var, 12),
+            ("Posição máxima (mm)", self.max_position_var, 12),
+            ("Ciclos", self.cycles_var, 7),
+            ("Espera retorno (s)", self.wait_before_return_var, 12),
+            ("Aquisição por deslocamento (mm)", self.acquisition_interval_var, 12),
+        )
+        for column, (label, variable, width) in enumerate(general_fields):
+            field = ttk.Frame(general)
+            field.grid(
+                row=0 if column < 5 else 1,
+                column=column if column < 5 else column - 5,
+                sticky="w",
+                padx=(0, 12),
+                pady=3,
+            )
+            label_widget = ttk.Label(
+                field,
+                text=(
+                    f"Carga-alvo ({self.force_unit_var.get()})"
+                    if variable is self.target_force_var
+                    else label
+                ),
+            )
+            label_widget.pack(anchor="w")
+            if variable is self.target_force_var:
+                self._target_force_labels.append(label_widget)
+            if variable is self.force_unit_var:
+                editor = ttk.Combobox(field, textvariable=variable, values=FORCE_UNITS, state="readonly", width=width)
+                editor.bind("<<ComboboxSelected>>", self._on_force_unit_changed)
+            else:
+                editor = ttk.Entry(field, textvariable=variable, width=width)
+            editor.pack(anchor="w")
+
+        traction = ttk.LabelFrame(content, text="Tração, durabilidade e norma", padding=8)
+        traction.pack(fill="x", pady=(0, 8))
+        traction_fields = (
+            ("Corpo de prova", self.specimen_type_var, 18),
+            ("Norma/procedimento", self.standard_var, 42),
+            ("Duração (h)", self.duration_h_var, 10),
+            ("Aquisição temporal (s)", self.acquisition_interval_s_var, 14),
+            ("Carga-alvo", self.target_force_var, 12),
+        )
+        for column, (label, variable, width) in enumerate(traction_fields):
+            field = ttk.Frame(traction)
+            field.grid(row=0, column=column, sticky="w", padx=(0, 12), pady=3)
+            label_widget = ttk.Label(
+                field,
+                text=(
+                    f"Carga-alvo ({self.force_unit_var.get()})"
+                    if variable is self.target_force_var
+                    else label
+                ),
+            )
+            label_widget.pack(anchor="w")
+            if variable is self.target_force_var:
+                self._target_force_labels.append(label_widget)
+            if variable is self.specimen_type_var:
+                editor = ttk.Combobox(field, textvariable=variable, values=SPECIMEN_TYPES, state="readonly", width=width)
+            else:
+                editor = ttk.Entry(field, textvariable=variable, width=width)
+            editor.pack(anchor="w")
+
+        ttk.Checkbutton(
+            traction,
+            text="Retorno automático à posição inicial após a tração",
+            variable=self.auto_return_traction_var,
+        ).grid(row=1, column=0, columnspan=len(traction_fields), sticky="w", pady=(5, 0))
+
+        profile = ttk.LabelFrame(content, text="Perfil de carga (opcional)", padding=8)
+        profile.pack(fill="x", pady=(0, 8))
+        ttk.Label(profile, text="JSON [{time_s, force_kn}]").pack(anchor="w")
+        ttk.Entry(profile, textvariable=self.load_profile_var).pack(fill="x", expand=True, pady=(2, 0))
+        actions = ttk.Frame(content)
+        actions.pack(fill="x", pady=(4, 0))
+        ttk.Button(
+            actions,
+            text="Aplicar configurações",
+            command=self._apply_test_settings,
+        ).pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text="Fechar", command=self._close_test_settings).pack(side="right")
+
+    def _close_test_settings(self) -> None:
+        window = getattr(self, "_settings_window", None)
+        self._settings_window = None
+        if window is not None and window.winfo_exists():
+            window.destroy()
+
+    def _apply_test_settings(self) -> None:
+        """Aplica os campos editados e sincroniza um ensaio de tração ativo."""
+        try:
+            program = self._collect_program()
+        except (ValueError, TypeError) as error:
+            messagebox.showerror("Programação inválida", str(error), parent=self)
+            return
+
+        if self._running and self._result_program is not None:
+            current = self._result_program
+            structural_fields = (
+                "specimen_type",
+                "steps",
+                "position_min_mm",
+                "position_max_mm",
+                "initial_position_mm",
+                "cycles",
+            )
+            if any(getattr(current, field) != getattr(program, field) for field in structural_fields):
+                messagebox.showwarning(
+                    "Ensaio em execução",
+                    "Durante o ensaio só é possível alterar duração, intervalo e carga. "
+                    "Pare o ensaio para alterar etapas ou limites.",
+                    parent=self,
+                )
+                self._load_program_to_ui()
+                return
+            self._result_program = deepcopy(program)
+            self._engine.program = program
+
+        self.program = program
+        self._load_program_to_ui()
+        if self._running:
+            self._save_checkpoint()
+            self.status_var.set(
+                "Configurações aplicadas. Duração do ensaio: "
+                f"{format_duration_display(program.duration_h)}."
+            )
+        else:
+            self.status_var.set("Configurações aplicadas ao próximo ensaio.")
+
     def _load_program_to_ui(self) -> None:
         self.name_var.set(self.program.name)
         self.force_unit_var.set(self.program.force_unit)
@@ -644,6 +931,34 @@ class TestProLabApp(tk.Tk):
         self.acquisition_interval_var.set(
             f"{self.program.acquisition_interval_mm:g}"
         )
+        self.specimen_type_var.set(self.program.specimen_type)
+        self.standard_var.set(self.program.standard)
+        self.duration_h_var.set(f"{self.program.duration_h:g}")
+        self.acquisition_interval_s_var.set(f"{self.program.acquisition_interval_s:g}")
+        self.target_force_var.set(
+            format_csv_number(
+                force_from_kn(self.program.target_force_kn, self.program.force_unit)
+            )
+        )
+        self.load_profile_var.set(json.dumps(self.program.load_profile, ensure_ascii=False))
+        self.auto_return_traction_var.set(self.program.auto_return_traction)
+        moving_step = next(
+            (
+                step
+                for step in self.program.steps
+                if step.action in ("compressao", "tracao") and step.speed_mm_min > 0
+            ),
+            None,
+        )
+        if moving_step is not None and "manual_speed_var" in self.__dict__:
+            self.manual_speed_var.set(f"{moving_step.speed_mm_min:g}")
+        if "settings_summary_var" in self.__dict__:
+            specimen = self.program.specimen_type or "compressao"
+            self.settings_summary_var.set(
+                f"{self.program.name}  |  Corpo de prova: {specimen}  |  "
+                f"Duração: {format_duration_display(self.program.duration_h)}  |  "
+                f"Aquisição: {self.program.acquisition_interval_s:g} s"
+            )
         if "force_var" in self.__dict__:
             self.force_var.set(
                 format_force(
@@ -666,15 +981,67 @@ class TestProLabApp(tk.Tk):
             self._displayed_force_unit = new_unit
             return
         self.limit_var.set(format_csv_number(force_from_kn(limit_kn, new_unit)))
+        target_variable = self.__dict__.get("target_force_var")
+        if target_variable is not None:
+            try:
+                target_kn = force_to_kn(
+                    self._number(target_variable.get()), previous_unit
+                )
+                target_variable.set(
+                    format_csv_number(force_from_kn(target_kn, new_unit))
+                )
+            except (ValueError, TypeError):
+                pass
         self._displayed_force_unit = new_unit
+        self._update_target_force_labels(new_unit)
         if "force_var" in self.__dict__:
             self.force_var.set(
                 format_force(self.__dict__.get("_last_force_kn", 0.0), new_unit, 2)
             )
+        self._publish_force_unit(new_unit)
+
+    def _update_target_force_labels(self, unit: str) -> None:
+        for label in self.__dict__.get("_target_force_labels", []):
+            try:
+                label.configure(text=f"Carga-alvo ({unit})")
+            except tk.TclError:
+                pass
+
+    def _publish_force_unit(self, unit: str) -> None:
+        machine = self.__dict__.get("machine")
+        backend = getattr(machine, "backend", None)
+        publish = getattr(backend, "set_display_unit", None)
+        if callable(publish):
+            try:
+                publish(unit)
+            except (OSError, RuntimeError, ValueError):
+                pass
         if "chart" in self.__dict__:
             self._draw_chart()
 
     def _collect_program(self) -> TestProgram:
+        try:
+            load_profile = json.loads(self.load_profile_var.get() or "[]")
+            if not isinstance(load_profile, list):
+                raise ValueError("O perfil de carga deve ser uma lista JSON.")
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Perfil de carga JSON invalido: {error.msg}") from error
+        steps = self._steps_with_manual_speed(self.program.steps)
+        # Ao trocar de compressão para tração pelos campos de configuração,
+        # etapas antigas de compressão não podem continuar sendo validadas.
+        # Isso fazia um novo ensaio de tração falhar com o alvo de posição
+        # herdado do modelo de compressão, embora esse campo não seja usado
+        # nesse tipo de ensaio.
+        if self.specimen_type_var.get() != "compressao":
+            steps = [step for step in steps if step.action in ("tracao", "manter")]
+            if not any(step.action == "tracao" for step in steps):
+                steps.append(
+                    TestStep(
+                        "tracao",
+                        target_position_mm=1.0,
+                        speed_mm_min=self._number(self.manual_speed_var.get()),
+                    )
+                )
         program = TestProgram(
             name=self.name_var.get().strip(),
             force_limit_kn=force_to_kn(
@@ -691,11 +1058,35 @@ class TestProLabApp(tk.Tk):
             acquisition_interval_mm=self._number(
                 self.acquisition_interval_var.get()
             ),
-            steps=list(self.program.steps),
+            steps=steps,
+            specimen_type=self.specimen_type_var.get(),
+            standard=self.standard_var.get().strip() or "Procedimento interno",
+            duration_h=self._number(self.duration_h_var.get()),
+            acquisition_interval_s=self._number(self.acquisition_interval_s_var.get()),
+            target_force_kn=force_to_kn(
+                self._number(self.target_force_var.get()), self.force_unit_var.get()
+            ),
+            traction_stiffness_kn_mm=self.program.traction_stiffness_kn_mm,
+            load_profile=load_profile,
+            auto_return_traction=self.auto_return_traction_var.get(),
         )
         program.validate()
         self.program = program
         return program
+
+    def _steps_with_manual_speed(self, steps: list[TestStep]) -> list[TestStep]:
+        """Inclui no programa a velocidade exibida no controle do software."""
+        copied_steps = list(steps)
+        if "manual_speed_var" not in self.__dict__:
+            return copied_steps
+        manual_speed = self._number(self.manual_speed_var.get())
+        if manual_speed <= 0:
+            raise ValueError("A velocidade deve ser maior que zero.")
+        for index, step in enumerate(copied_steps):
+            if step.action in ("compressao", "tracao"):
+                copied_steps[index] = replace(step, speed_mm_min=manual_speed)
+                break
+        return copied_steps
 
     def _show_steps(self) -> None:
         if self._steps_window is not None and self._steps_window.winfo_exists():
@@ -803,7 +1194,10 @@ class TestProLabApp(tk.Tk):
         if not path:
             return
         try:
-            self._apply_template(TestProgram.load(path))
+            program = TestProgram.load(path)
+            self._apply_template(program)
+            LAST_IMPORTED_PROGRAM.parent.mkdir(parents=True, exist_ok=True)
+            program.save(LAST_IMPORTED_PROGRAM)
             self.status_var.set(f"Programa aberto: {Path(path).name}")
         except (OSError, ValueError, KeyError, TypeError) as error:
             messagebox.showerror("Não foi possível abrir", str(error))
@@ -879,13 +1273,28 @@ class TestProLabApp(tk.Tk):
             configure_safety = getattr(self.machine, "configure_safety", None)
             if callable(configure_safety):
                 configure_safety(program.force_limit_kn)
-            self.machine.begin_test()
+            configure_target_force = getattr(self.machine, "configure_target_force", None)
+            if callable(configure_target_force):
+                configure_target_force(
+                    program.target_force_kn if program.specimen_type != "compressao" else None
+                )
+            traction_step = next(
+                (step for step in program.steps if step.action == "tracao"), None
+            )
+            self.machine.begin_test(
+                traction_step.speed_mm_min if traction_step is not None else None
+            )
         except (OSError, RuntimeError, TimeoutError, ValueError) as error:
             messagebox.showerror("Não foi possível iniciar", str(error))
             return
         self.samples = []
+        self._live_chart_sample = None
         self._result_program = deepcopy(program)
-        self._engine = SimulationEngine(program)
+        self._engine = (
+            TractionEngine(program)
+            if program.specimen_type != "compressao"
+            else SimulationEngine(program)
+        )
         self._sample_iter = iter(self._engine.samples())
         self._pending_sample = None
         self._started_monotonic = time.monotonic()
@@ -893,7 +1302,9 @@ class TestProLabApp(tk.Tk):
         self._current_run_started_at = datetime.now(timezone.utc).isoformat()
         self._running = True
         self._paused = False
+        self._schedule_chart_refresh()
         self.pause_button.configure(text="Pausar")
+        self._save_checkpoint()
         self._update_current_run_row()
         if getattr(self.machine.backend, "is_physical", False):
             self.status_var.set(
@@ -906,6 +1317,240 @@ class TestProLabApp(tk.Tk):
                 f"Carga = {format_force(0.0, program.force_unit)} enquanto não houver sensor conectado."
             )
         self._advance()
+
+    def _save_checkpoint(self) -> None:
+        if (
+            "repository" not in self.__dict__
+            or self._result_program is None
+            or not getattr(self, "_current_run_started_at", "")
+        ):
+            return
+        backend = self.machine.backend
+        machine_state = (
+            backend.checkpoint_state()
+            if callable(getattr(backend, "checkpoint_state", None))
+            else None
+        )
+        # Durante a recuperação o controlador começa localmente enquanto a
+        # conexão USB é restabelecida. Não deixe esse backend temporário
+        # sobrescrever o último estado físico salvo (carga/posição reais).
+        recovered_physical_state = self.__dict__.get("_recovered_physical_state")
+        if recovered_physical_state is not None and not getattr(
+            backend, "is_physical", False
+        ):
+            machine_state = recovered_physical_state
+        if getattr(backend, "is_physical", False) and machine_state is not None:
+            self._last_physical_checkpoint = dict(machine_state)
+            if self.samples:
+                self._recovered_sample = self.samples[-1]
+        self.repository.save_checkpoint(
+            self._result_program,
+            self.samples,
+            self.machine.mode_name,
+            self._current_run_started_at,
+            "pausado" if self._paused else "em execução",
+            machine_state=machine_state,
+        )
+        self._last_checkpoint_monotonic = time.monotonic()
+
+    def _remember_physical_checkpoint(self, backend: object) -> None:
+        """Mantém o último estado físico mesmo entre aquisições do ensaio."""
+        capture = getattr(backend, "checkpoint_state", None)
+        if not callable(capture):
+            return
+        try:
+            state = capture()
+        except (OSError, RuntimeError, TimeoutError, ValueError):
+            return
+        if not isinstance(state, dict):
+            return
+        if state.get("force_kn") is None or state.get("position_mm") is None:
+            return
+        self._last_physical_checkpoint = dict(state)
+        self._recovered_physical_state = dict(state)
+        if (
+            getattr(self, "_running", False)
+            and getattr(self, "_result_program", None) is not None
+            and getattr(self, "_current_run_started_at", "")
+            and time.monotonic() - getattr(self, "_last_checkpoint_monotonic", 0.0) >= 1.0
+        ):
+            self._save_checkpoint()
+
+    def _recover_checkpoint(self) -> None:
+        checkpoint = self.repository.get_checkpoint()
+        if checkpoint is None:
+            # O histórico permanente não representa um ensaio ativo. Ao abrir
+            # o programa sem checkpoint, mantenha a tela em "Novo ensaio"
+            # para não apresentar aquisições antigas como retomáveis.
+            return
+        samples = list(checkpoint["samples"])
+        program = checkpoint["program"]
+        checkpoint_at = datetime.fromisoformat(
+            str(checkpoint["checkpoint_at"]).replace("Z", "+00:00")
+        )
+        downtime_s = max(0.0, (datetime.now(timezone.utc) - checkpoint_at).total_seconds())
+        elapsed_s = float(checkpoint["elapsed_s"]) + downtime_s
+        resume = messagebox.askyesno(
+            "Ensaio recuperável",
+            f"Foi encontrado um ensaio interrompido com {len(samples)} aquisições.\n"
+            f"O tempo desligado ({downtime_s:.0f} s) será somado ao ensaio.\n\n"
+            "Deseja continuar?",
+            parent=self,
+        )
+        if not resume:
+            self.repository.clear_checkpoint()
+            return
+        self.program = deepcopy(program)
+        self.samples = samples
+        self._result_program = deepcopy(program)
+        self._load_program_to_ui()
+        self._draw_chart()
+        self.machine.configure_limits(program.position_min_mm, program.position_max_mm)
+        configure_safety = getattr(self.machine, "configure_safety", None)
+        if callable(configure_safety):
+            configure_safety(program.force_limit_kn)
+        configure_target_force = getattr(self.machine, "configure_target_force", None)
+        if callable(configure_target_force):
+            configure_target_force(
+                program.target_force_kn if program.specimen_type != "compressao" else None
+            )
+        traction_step = next(
+            (step for step in program.steps if step.action == "tracao"), None
+        )
+        self._recovered_physical_state = checkpoint.get("machine_state")
+        self._recovered_sample = samples[-1] if samples else None
+        # Se a máquina física já estiver conectada, nenhum movimento pode ser
+        # comandado antes de restaurar a carga/posição do checkpoint.
+        if not getattr(self.machine.backend, "is_physical", False):
+            self.machine.begin_test(
+                traction_step.speed_mm_min if traction_step is not None else None
+            )
+        self._engine = (
+            TractionEngine(
+                program,
+                start_elapsed_s=elapsed_s,
+                start_position_mm=(samples[-1].position_mm if samples else None),
+            )
+            if program.specimen_type != "compressao"
+            else SimulationEngine(program, start_elapsed_s=elapsed_s)
+        )
+        self._sample_iter = iter(self._engine.samples())
+        self._pending_sample = None
+        last_time = max((sample.time_s for sample in samples), default=-1.0)
+        while True:
+            try:
+                candidate = next(self._sample_iter)
+            except StopIteration:
+                self._running = False
+                self.repository.clear_checkpoint()
+                self.status_var.set("Ensaio recuperado já estava concluído.")
+                return
+            if candidate.time_s > last_time + 1e-9:
+                self._pending_sample = candidate
+                break
+        if samples:
+            self._restore_recovered_sample(samples[-1])
+            if not getattr(self.machine.backend, "is_physical", False):
+                restore = getattr(self.machine.backend, "restore_checkpoint", None)
+                if callable(restore):
+                    restore(self._recovered_physical_state)
+        self._current_run_started_at = str(checkpoint["started_at"])
+        self._started_monotonic = time.monotonic() - elapsed_s
+        self._pause_started_monotonic = None
+        self._running = True
+        self._paused = False
+        self.pause_button.configure(text="Pausar")
+        self._update_current_run_row()
+        self.status_var.set(
+            f"Ensaio recuperado. Tempo acumulado: {elapsed_s:.1f} s; continuando aquisição."
+        )
+        self._advance()
+
+    def _restore_recovered_sample(self, sample: Sample) -> None:
+        """Reaplica a última aquisição para a tela e para o backend local."""
+        if not getattr(self.machine.backend, "is_physical", False):
+            self.machine.apply_sample(sample)
+        self._last_force_kn = sample.force_kn
+        force_unit = self._selected_force_unit()
+        self.force_var.set(format_force(sample.force_kn, force_unit, 2))
+        self.position_var.set(f"{sample.position_mm:.2f} mm".replace(".", ","))
+        self.displacement_var.set(
+            f"{sample.displacement_mm:.2f} mm".replace(".", ",")
+        )
+        self.time_var.set(format_elapsed_display(sample.time_s))
+        self.stage_var.set(
+            format_stage_status(
+                sample.cycle,
+                self.program.cycles,
+                sample.action,
+                sample.step,
+            )
+        )
+
+    def _resume_physical_checkpoint(self, backend: object) -> bool:
+        if not self.__dict__.get("_running", False):
+            return True
+        restore = getattr(backend, "restore_checkpoint", None)
+        resume = getattr(backend, "resume_test", None)
+        sample = getattr(self, "_recovered_sample", None)
+        try:
+            if callable(restore):
+                restore(getattr(self, "_recovered_physical_state", None))
+        except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+            self._paused = True
+            self._running = False
+            self.stage_var.set("RETOMADA BLOQUEADA POR SEGURANÇA")
+            self.status_var.set(
+                f"{error} Nenhum movimento foi comandado; verifique a montagem "
+                "e retome manualmente somente após confirmar a carga."
+            )
+            return False
+        if callable(resume) and sample is not None:
+            step = next(
+                (item for item in self.program.steps if item.action == sample.action),
+                None,
+            )
+            if step is None:
+                speed = None
+            elif sample.action == "descompressao":
+                compression = next(
+                    (item for item in self.program.steps if item.action == "compressao"),
+                    None,
+                )
+                speed = -(compression.speed_mm_min if compression else step.speed_mm_min)
+            else:
+                target = motion_target_position(
+                    self.program.initial_position_mm,
+                    sample.action,
+                    step.target_position_mm,
+                )
+                speed = step.speed_mm_min * (
+                    1 if target >= sample.position_mm else -1
+                )
+            resume(sample, speed)
+        # O tempo em que a USB ficou fora nao cria movimento virtual.
+        if sample is not None:
+            self._started_monotonic = time.monotonic() - sample.time_s
+        self._paused = False
+        self._running = True
+        return True
+
+    def _load_latest_saved_run(self) -> None:
+        """Restaura na tela o último ensaio concluído salvo no histórico."""
+        latest_run = self.repository.latest_run()
+        if latest_run is None:
+            return
+        self.program = deepcopy(latest_run.program)
+        self.samples = list(latest_run.samples)
+        self._result_program = deepcopy(latest_run.program)
+        self._current_run_started_at = latest_run.started_at
+        self._running = False
+        self._paused = False
+        self._load_program_to_ui()
+        self._draw_chart()
+        self.status_var.set(
+            f"Último ensaio carregado: #{latest_run.id} — {latest_run.program.name}."
+        )
 
     def _probe_hardware(self) -> None:
         result = probe_project_ftdi(DRIVER_ROOT)
@@ -922,9 +1567,6 @@ class TestProLabApp(tk.Tk):
     def _auto_connect_hardware(self) -> None:
         self._auto_connect_job = None
         if getattr(self.machine.backend, "is_physical", False):
-            return
-        if getattr(self, "_running", False):
-            self._schedule_auto_connect()
             return
         self._start_hardware_connection()
 
@@ -998,23 +1640,27 @@ class TestProLabApp(tk.Tk):
             self.status_var.set(connection_detail)
             return False
         if result.dll_path is None:
+            self.hardware_var.set("MÁQUINA OFFLINE — DLL indisponível")
             self.status_var.set("Falha ao conectar: a DLL D2XX compatível não foi localizada.")
             return False
         if attempt.error is not None:
             connection_mode = "automaticamente" if automatic else "diretamente"
+            self.hardware_var.set("MÁQUINA OFFLINE — falha de conexão")
             self.status_var.set(
                 f"Falha ao conectar {connection_mode} com a M231: {attempt.error}"
             )
             return False
         if attempt.backend is None:
+            self.hardware_var.set("MÁQUINA OFFLINE — conexão não confirmada")
             self.status_var.set("Falha ao conectar: a tentativa não retornou um controlador.")
             return False
         self.machine.set_backend(attempt.backend)
-        self.hardware_var.set("MÁQUINA ONLINE — controle Python nativo")
-        self.status_var.set(
-            "Máquina conectada automaticamente por Python/D2XX. "
-            "Comandos manuais, zeragens, retorno, execução, pausa e parada estão ativos."
-        )
+        resume_ok = self._resume_physical_checkpoint(attempt.backend)
+        self._start_physical_telemetry(attempt.backend)
+        self._publish_force_unit(self._selected_force_unit())
+        self.hardware_var.set("Conex\u00e3o OK")
+        if resume_ok:
+            self.status_var.set("Conex\u00e3o OK")
         return True
 
     def _connect_hardware(self, automatic: bool = False) -> bool:
@@ -1024,6 +1670,47 @@ class TestProLabApp(tk.Tk):
             self._attempt_hardware_connection(),
             automatic=automatic,
         )
+
+    def _start_physical_telemetry(self, backend: object) -> None:
+        """Lê a D2XX fora da thread do Tk para uma chamada nativa não congelar a UI."""
+        telemetry = getattr(backend, "telemetry", None)
+        if not callable(telemetry):
+            return
+        self._stop_physical_telemetry()
+        self._physical_telemetry_async = True
+        # Cada conexão precisa ter sua própria fila. A thread anterior pode
+        # ainda estar saindo quando a reconexão começa; se ela publicar na
+        # fila compartilhada, o erro antigo derruba a sessão recém-conectada
+        # e deixa a máquina virtual bloqueada após a reconexão.
+        telemetry_results = queue.Queue()
+        self._telemetry_results = telemetry_results
+        self._telemetry_stop = threading.Event()
+        stop = self._telemetry_stop
+
+        def worker() -> None:
+            while not stop.is_set():
+                try:
+                    value = telemetry()
+                except (OSError, RuntimeError, TimeoutError) as error:
+                    telemetry_results.put(("error", error))
+                    return
+                telemetry_results.put(("value", value))
+                if stop.wait(0.1):
+                    return
+
+        self._telemetry_thread = threading.Thread(
+            target=worker,
+            name="m231-telemetry",
+            daemon=True,
+        )
+        self._telemetry_thread.start()
+
+    def _stop_physical_telemetry(self) -> None:
+        telemetry_stop = self.__dict__.get("_telemetry_stop")
+        if telemetry_stop is not None:
+            telemetry_stop.set()
+        self._telemetry_thread = None
+        self._physical_telemetry_async = False
 
     def _manual_speed(self) -> float:
         speed = self._number(self.manual_speed_var.get())
@@ -1115,24 +1802,54 @@ class TestProLabApp(tk.Tk):
 
     def _poll_machine(self) -> None:
         try:
-            telemetry = self.machine.telemetry()
+            if getattr(self.machine.backend, "is_physical", False):
+                if self.__dict__.get("_physical_telemetry_async", False):
+                    telemetry = None
+                    while True:
+                        try:
+                            result_kind, result_value = self._telemetry_results.get_nowait()
+                        except queue.Empty:
+                            break
+                        if result_kind == "error":
+                            raise result_value
+                        telemetry = result_value
+                    if telemetry is None:
+                        self.after(100, self._poll_machine)
+                        return
+                else:
+                    telemetry = self.machine.telemetry()
+            else:
+                telemetry = self.machine.telemetry()
         except (OSError, RuntimeError, TimeoutError) as error:
             self.hardware_var.set("MÁQUINA OFFLINE — falha de comunicação")
             self.machine_state_var.set("Falha de comunicação")
             if getattr(self.machine.backend, "is_physical", False):
+                self._stop_physical_telemetry()
                 was_running = getattr(self, "_running", False)
-                self._running = False
-                self._paused = False
-                self._sample_iter = None
-                self._pending_sample = None
+                # Preserve o ensaio congelado ate a M231 voltar e o checkpoint
+                # fisico ser reaplicado; a maquina local nao deve avancar.
+                self._paused = was_running
+                self._pause_started_monotonic = (
+                    time.monotonic() if was_running else None
+                )
+                if was_running:
+                    self._recovered_sample = self.samples[-1] if self.samples else None
+                    saved_state = self.__dict__.get("_last_physical_checkpoint")
+                    if saved_state is not None:
+                        self._recovered_physical_state = dict(saved_state)
+                    elif self._recovered_sample is not None:
+                        sample = self._recovered_sample
+                        self._recovered_physical_state = {
+                            "force_kn": sample.force_kn,
+                            "position_mm": sample.position_mm,
+                            "displacement_mm": sample.displacement_mm,
+                        }
                 self._return_direction = 0
                 try:
                     self.machine.disconnect()
                 except (OSError, RuntimeError, TimeoutError):
                     pass
                 self.machine.backend = LocalMachineBackend()
-                if was_running and self.samples:
-                    self._persist_result("conexao_perdida")
                 self.status_var.set(
                     f"Conexão perdida: {error}. Aguardando a máquina para reconectar automaticamente."
                 )
@@ -1151,8 +1868,38 @@ class TestProLabApp(tk.Tk):
             self._return_direction = 0
         self._last_machine_position = telemetry.position_mm
         self._last_force_kn = telemetry.force_kn
+        self._remember_physical_checkpoint(self.machine.backend)
+        self._update_live_chart_sample(telemetry)
+        previous_force = self.__dict__.get("_previous_physical_force_kn")
+        self._previous_physical_force_kn = telemetry.force_kn
         self._last_machine_state = telemetry.state
+        if (
+            getattr(self, "_running", False)
+            and time.monotonic() - self.__dict__.get("_last_checkpoint_monotonic", 0.0)
+            >= 0.5
+        ):
+            self._save_checkpoint()
         self._set_manual_motion_indicator(telemetry.state)
+        if (
+            getattr(self.machine.backend, "is_physical", False)
+            and getattr(self, "_running", False)
+            and not getattr(self, "_paused", False)
+            and previous_force is not None
+            and previous_force >= max(0.05, self.program.target_force_kn * 0.5)
+            and telemetry.force_kn <= previous_force * 0.65
+        ):
+            self._paused = True
+            self._pause_started_monotonic = time.monotonic()
+            self.machine.pause()
+            self.pause_button.configure(text="Continuar")
+            self.stage_var.set("PAUSADO — POSSÍVEL RUPTURA DO PINO")
+            self.status_var.set(
+                "Queda brusca de carga detectada; ensaio pausado. "
+                "Reposicione a máquina e pressione Continuar para testar os pinos restantes."
+            )
+            self._save_checkpoint()
+            self.after(100, self._poll_machine)
+            return
         force_unit = self._selected_force_unit()
         self.force_var.set(format_force(telemetry.force_kn, force_unit, 2))
         self.position_var.set(f"{telemetry.position_mm:.2f} mm".replace(".", ","))
@@ -1203,10 +1950,48 @@ class TestProLabApp(tk.Tk):
                 self._persist_result("alarme")
         self.after(100, self._poll_machine)
 
+    def _update_live_chart_sample(self, telemetry: object) -> None:
+        """Mantém no gráfico a última telemetria sem persistir uma amostra extra."""
+        if not getattr(self, "_running", False):
+            return
+        if not all(
+            hasattr(telemetry, attribute)
+            for attribute in ("force_kn", "position_mm", "displacement_mm")
+        ):
+            return
+        started = getattr(self, "_started_monotonic", time.monotonic())
+        paused_at = getattr(self, "_pause_started_monotonic", None)
+        clock = paused_at if paused_at is not None else time.monotonic()
+        elapsed_s = max(0.0, clock - started)
+        latest = self.samples[-1] if self.samples else None
+        self._live_chart_sample = Sample(
+            elapsed_s,
+            float(telemetry.force_kn),
+            float(telemetry.position_mm),
+            float(telemetry.displacement_mm),
+            latest.cycle if latest is not None else 1,
+            latest.step if latest is not None else 0,
+            latest.action if latest is not None else "inicio",
+            False,
+        )
+        if hasattr(self, "chart"):
+            self._draw_chart()
+
     def _close_app(self) -> None:
         try:
             self._closing = True
+            if getattr(self, "_running", False):
+                self._save_checkpoint()
+            clock_job = getattr(self, "_clock_job", None)
+            if clock_job is not None:
+                self.after_cancel(clock_job)
+                self._clock_job = None
+            chart_job = self.__dict__.get("_chart_job")
+            if chart_job is not None:
+                self.after_cancel(chart_job)
+                self._chart_job = None
             self._connection_cancelled.set()
+            self._stop_physical_telemetry()
             if self._auto_connect_job is not None:
                 self.after_cancel(self._auto_connect_job)
                 self._auto_connect_job = None
@@ -1227,6 +2012,8 @@ class TestProLabApp(tk.Tk):
     def _advance(self) -> None:
         if not self._running:
             return
+        if getattr(self, "_clock_job", None) is None:
+            self._update_elapsed_clock()
         if self._paused:
             self.after(50, self._advance)
             return
@@ -1256,6 +2043,19 @@ class TestProLabApp(tk.Tk):
             return
         self._pending_sample = None
         self.machine.apply_sample(sample)
+        traction_finished = (
+            sample.action == "tracao"
+            and self.program.auto_return_traction
+            and sample.time_s >= self.program.duration_h * 3600.0 - 1e-9
+        )
+        if traction_finished:
+            traction_step = next(
+                step for step in self.program.steps if step.action == "tracao"
+            )
+            self.machine.return_position(
+                self.program.initial_position_mm,
+                traction_step.speed_mm_min,
+            )
         if getattr(self.machine.backend, "is_physical", False):
             physical = self.machine.telemetry()
             sample = replace(
@@ -1269,8 +2069,17 @@ class TestProLabApp(tk.Tk):
                     else sample.action
                 ),
             )
+            sample = replace(
+                sample,
+                displacement_mm=oriented_displacement(
+                    self.program.initial_position_mm,
+                    sample.position_mm,
+                    sample.action,
+                ),
+            )
         if sample.acquired:
             self.samples.append(sample)
+            self._save_checkpoint()
             self._draw_chart()
             self._update_current_run_row()
         self._last_force_kn = sample.force_kn
@@ -1278,7 +2087,7 @@ class TestProLabApp(tk.Tk):
         self.force_var.set(format_force(sample.force_kn, force_unit, 2))
         self.position_var.set(f"{sample.position_mm:.2f} mm".replace(".", ","))
         self.displacement_var.set(f"{sample.displacement_mm:.2f} mm".replace(".", ","))
-        self.time_var.set(f"{sample.time_s:.2f} s".replace(".", ","))
+        self.time_var.set(format_elapsed_display(sample.time_s))
         if sample.action == "limite_seguranca":
             self._running = False
             self.machine.emergency_stop("Limite de carga excedido")
@@ -1292,10 +2101,54 @@ class TestProLabApp(tk.Tk):
             self._persist_result("alarme")
             return
         self.stage_var.set(
-            f"Ciclo {sample.cycle}/{self.program.cycles} · "
-            f"{ACTION_LABELS.get(sample.action, 'Início')} · etapa {sample.step}"
+            format_stage_status(
+                sample.cycle,
+                self.program.cycles,
+                sample.action,
+                sample.step,
+            )
         )
+        if traction_finished:
+            # O ensaio termina no tempo configurado. O retorno é movimento
+            # físico independente e não deve prolongar o relógio do ensaio.
+            self._running = False
+            self._pending_sample = None
+            self._draw_chart()
+            run_id = self._persist_result("concluído")
+            self.stage_var.set("Ensaio concluído · retornando à posição inicial")
+            self.status_var.set(
+                f"Ensaio concluído em {sample.time_s:.2f} s; "
+                f"retorno comandado pela velocidade configurada. Execução #{run_id} salva no histórico."
+            )
+            return
         self.after(1, self._advance)
+
+    def _update_elapsed_clock(self) -> None:
+        """Atualiza o relógio visual continuamente, sem depender de aquisições."""
+        if not self._running:
+            self._clock_job = None
+            return
+        reference = self._pause_started_monotonic
+        now = reference if reference is not None else time.monotonic()
+        elapsed_s = max(0.0, now - self._started_monotonic)
+        self.time_var.set(format_elapsed_display(elapsed_s))
+        self._clock_job = self.after(100, self._update_elapsed_clock)
+
+    def _schedule_chart_refresh(self) -> None:
+        """Mantém o gráfico visualmente atualizado uma vez por segundo."""
+        if "tk" not in self.__dict__:
+            return
+        chart_job = self.__dict__.get("_chart_job")
+        if chart_job is not None:
+            self.after_cancel(chart_job)
+        self._chart_job = self.after(1000, self._refresh_chart)
+
+    def _refresh_chart(self) -> None:
+        self._chart_job = None
+        if not self._running:
+            return
+        self._draw_chart()
+        self._schedule_chart_refresh()
 
     def _toggle_pause(self) -> None:
         if not self._running:
@@ -1316,9 +2169,14 @@ class TestProLabApp(tk.Tk):
     def _stop(self) -> None:
         was_running = getattr(self, "_running", False)
         self._running = False
+        chart_job = self.__dict__.get("_chart_job")
+        if chart_job is not None:
+            self.after_cancel(chart_job)
+            self._chart_job = None
         self._paused = False
         self._sample_iter = None
         self._pending_sample = None
+        self._live_chart_sample = None
         self._pause_started_monotonic = None
         if hasattr(self, "machine"):
             self.machine.stop()
@@ -1340,6 +2198,9 @@ class TestProLabApp(tk.Tk):
             mode,
             status,
         )
+        clear_checkpoint = getattr(self.repository, "clear_checkpoint", None)
+        if callable(clear_checkpoint):
+            clear_checkpoint()
         session_runs = self.__dict__.setdefault("_session_runs", [])
         session_runs.insert(
             0,
@@ -1781,12 +2642,27 @@ class TestProLabApp(tk.Tk):
         plot_width = max(plot_right - plot_left, 1)
         plot_height = max(plot_bottom - plot_top, 1)
         chart_samples = acquired_samples(self.samples)
+        live_sample = self.__dict__.get("_live_chart_sample")
+        if live_sample is not None and (
+            not chart_samples
+            or live_sample.time_s >= chart_samples[-1].time_s - 1e-9
+        ):
+            chart_samples = [*chart_samples, live_sample]
         if not chart_samples:
             canvas.create_line(plot_left, plot_top, plot_left, plot_bottom, fill="#777")
             canvas.create_line(plot_left, plot_bottom, plot_right, plot_bottom, fill="#777")
             canvas.create_line(plot_right, plot_top, plot_right, plot_bottom, fill="#777")
-            canvas.create_text(8, 12, text="Compressão (mm)", anchor="nw", fill="#0066cc")
-            canvas.create_text(width - 8, 12, text="Retorno (mm)", anchor="ne", fill="#d76500")
+            result_program = self._result_program or self.program
+            is_traction = result_program.specimen_type != "compressao"
+            canvas.create_text(
+                8,
+                12,
+                text=f"Tração ({result_program.force_unit})" if is_traction else "Compressão (mm)",
+                anchor="nw",
+                fill="#0066cc",
+            )
+            if not is_traction:
+                canvas.create_text(width - 8, 12, text="Retorno (mm)", anchor="ne", fill="#d76500")
             canvas.create_text(
                 (plot_left + plot_right) / 2,
                 height - 6,
@@ -1802,42 +2678,64 @@ class TestProLabApp(tk.Tk):
             )
             return
         result_program = self._result_program or self.program
+        is_traction = result_program.specimen_type != "compressao"
         measured_max_time = max(sample.time_s for sample in chart_samples)
         max_time = measured_max_time or 1.0
-        position_min = result_program.position_min_mm
-        position_range = result_program.position_max_mm - position_min
-        position_max = result_program.position_max_mm
+        force_unit = result_program.force_unit
+        metric_values = [
+            force_from_kn(sample.force_kn, force_unit) if is_traction else sample.position_mm
+            for sample in chart_samples
+        ]
+        metric_min = min(metric_values)
+        metric_max = max(metric_values)
+        if abs(metric_max - metric_min) < 1e-12:
+            padding = max(abs(metric_max) * 0.1, 1.0)
+            metric_min -= padding
+            metric_max += padding
+        metric_range = metric_max - metric_min
 
-        compression_positions = chart_position_marks(
-            chart_samples, {"inicio", "compressao", "manter"}
+        primary_actions = {"inicio", "tracao", "manter"} if is_traction else {
+            "inicio", "compressao", "manter"
+        }
+        return_actions = {
+            "descompressao"
+        } if is_traction else {
+            "aguardar_descompressao", "descompressao"
+        }
+        compression_positions = (
+            [force_from_kn(sample.force_kn, force_unit) for sample in chart_samples
+             if sample.action in primary_actions]
+            if is_traction else chart_position_marks(chart_samples, primary_actions)
         )
-        return_positions = chart_position_marks(
-            chart_samples, {"aguardar_descompressao", "descompressao"}
+        return_positions = (
+            [force_from_kn(sample.force_kn, force_unit) for sample in chart_samples
+             if sample.action in return_actions]
+            if is_traction else chart_position_marks(chart_samples, return_actions)
         )
         grid_positions = spaced_chart_marks(
-            chart_position_marks(chart_samples),
-            position_min,
-            position_max,
+            metric_values,
+            metric_min,
+            metric_max,
             plot_height,
         )
         compression_marks = spaced_chart_marks(
             compression_positions,
-            position_min,
-            position_max,
+            metric_min,
+            metric_max,
             plot_height,
         )
         return_marks = spaced_chart_marks(
             return_positions,
-            position_min,
-            position_max,
+            metric_min,
+            metric_max,
             plot_height,
         )
 
-        def position_y(position: float) -> float:
-            return plot_bottom - (position - position_min) / position_range * plot_height
+        def metric_y(value: float) -> float:
+            return plot_bottom - (value - metric_min) / metric_range * plot_height
 
         for position in grid_positions:
-            y = position_y(position)
+            y = metric_y(position)
             canvas.create_line(
                 plot_left,
                 y,
@@ -1848,7 +2746,7 @@ class TestProLabApp(tk.Tk):
             )
 
         for position in compression_marks:
-            y = position_y(position)
+            y = metric_y(position)
             canvas.create_line(plot_left - 4, y, plot_left, y, fill="#0066cc")
             canvas.create_text(
                 plot_left - 8,
@@ -1859,7 +2757,7 @@ class TestProLabApp(tk.Tk):
             )
 
         for position in return_marks:
-            y = position_y(position)
+            y = metric_y(position)
             canvas.create_line(plot_right, y, plot_right + 4, y, fill="#d76500")
             canvas.create_text(
                 plot_right + 8,
@@ -1872,8 +2770,20 @@ class TestProLabApp(tk.Tk):
         canvas.create_line(plot_left, plot_top, plot_left, plot_bottom, fill="#777")
         canvas.create_line(plot_left, plot_bottom, plot_right, plot_bottom, fill="#777")
         canvas.create_line(plot_right, plot_top, plot_right, plot_bottom, fill="#777")
-        canvas.create_text(8, 12, text="Compressão (mm)", anchor="nw", fill="#0066cc")
-        canvas.create_text(width - 8, 12, text="Retorno (mm)", anchor="ne", fill="#d76500")
+        canvas.create_text(
+            8,
+            12,
+            text=f"Tração ({force_unit})" if is_traction else "Compressão (mm)",
+            anchor="nw",
+            fill="#0066cc",
+        )
+        canvas.create_text(
+            width - 8,
+            12,
+            text="Retorno (mm)" if not is_traction else "Retorno",
+            anchor="ne",
+            fill="#d76500",
+        )
         canvas.create_text(
             (plot_left + plot_right) / 2,
             height - 6,
@@ -1886,7 +2796,11 @@ class TestProLabApp(tk.Tk):
         previous_point: tuple[float, float] | None = None
         for sample in chart_samples:
             x = plot_left + sample.time_s / max_time * plot_width
-            y = position_y(sample.position_mm)
+            metric_value = (
+                force_from_kn(sample.force_kn, force_unit)
+                if is_traction else sample.position_mm
+            )
+            y = metric_y(metric_value)
             color = "#d76500" if sample.action in {
                 "aguardar_descompressao",
                 "descompressao",
@@ -1935,8 +2849,11 @@ class TestProLabApp(tk.Tk):
             width / 2,
             12,
             text=(
-                f"{len(chart_samples)} aquisições · "
-                f"intervalo {result_program.acquisition_interval_mm:g} mm"
+                f"{len(chart_samples)} aquisições · " + (
+                    f"intervalo {result_program.acquisition_interval_s:g} s"
+                    if is_traction
+                    else f"intervalo {result_program.acquisition_interval_mm:g} mm"
+                )
             ),
             anchor="n",
             fill="#555",
@@ -1996,7 +2913,8 @@ class StepDialog(tk.Toplevel):
         action_box = ttk.Combobox(frame, textvariable=self.action_var, values=list(LABEL_ACTIONS), state="readonly", width=26)
         action_box.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         action_box.bind("<<ComboboxSelected>>", lambda _event: self._update_fields())
-        ttk.Label(frame, text="Posição-alvo (mm)").grid(row=2, column=0, sticky="w")
+        self.target_label = ttk.Label(frame, text="Posição-alvo (mm)")
+        self.target_label.grid(row=2, column=0, sticky="w")
         self.target_entry = ttk.Entry(frame, textvariable=self.target_var)
         self.target_entry.grid(row=3, column=0, sticky="ew", padx=(0, 8), pady=(0, 8))
         ttk.Label(frame, text="Velocidade (mm/min)").grid(row=2, column=1, sticky="w")
@@ -2019,8 +2937,12 @@ class StepDialog(tk.Toplevel):
 
     def _update_fields(self) -> None:
         action = LABEL_ACTIONS[self.action_var.get()]
-        self.target_entry.configure(state="normal" if action == "compressao" else "disabled")
-        self.speed_entry.configure(state="normal" if action == "compressao" else "disabled")
+        is_position_controlled = action == "compressao"
+        self.target_label.configure(
+            text="Posição-alvo (mm)" if is_position_controlled else "Posição (calculada pela carga)"
+        )
+        self.target_entry.configure(state="normal" if is_position_controlled else "disabled")
+        self.speed_entry.configure(state="normal" if action in ("compressao", "tracao") else "disabled")
         self.duration_entry.configure(state="normal" if action == "manter" else "disabled")
         self.return_note.configure(
             foreground="#8a3300" if action == "descompressao" else "#777"
@@ -2032,12 +2954,12 @@ class StepDialog(tk.Toplevel):
             self.result = TestStep(
                 action=action,
                 target_position_mm=float(self.target_var.get().replace(",", ".")) if action == "compressao" else 0.0,
-                speed_mm_min=float(self.speed_var.get().replace(",", ".")) if action == "compressao" else 0.0,
+                speed_mm_min=float(self.speed_var.get().replace(",", ".")) if action in ("compressao", "tracao") else 0.0,
                 duration_s=float(self.duration_var.get().replace(",", ".")) if action == "manter" else 0.0,
             )
             if action == "manter" and self.result.duration_s <= 0:
                 raise ValueError("Informe um tempo maior que zero.")
-            if action == "compressao" and self.result.speed_mm_min <= 0:
+            if action in ("compressao", "tracao") and self.result.speed_mm_min <= 0:
                 raise ValueError("Informe uma velocidade maior que zero.")
         except (ValueError, KeyError) as error:
             messagebox.showerror("Valor inválido", str(error), parent=self)

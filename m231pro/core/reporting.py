@@ -15,11 +15,20 @@ MARGIN = 36.0
 ACTION_LABELS = {
     "inicio": "Início",
     "compressao": "Compressão",
+    "tracao": "Tração",
     "descompressao": "Retorno",
     "manter": "Manter posição",
     "aguardar_descompressao": "Espera",
     "limite_seguranca": "Limite de segurança",
 }
+
+
+def format_duration_display(duration_h: float) -> str:
+    """Exibe durações curtas em segundos e as demais em horas."""
+    duration_h = float(duration_h)
+    if 0 <= duration_h < 1:
+        return f"{_number(duration_h * 3600.0)} s"
+    return f"{_number(duration_h)} h"
 
 
 def report_filename(run: StoredRun) -> str:
@@ -71,20 +80,35 @@ def _summary_page(run: StoredRun, samples: list[Sample]) -> bytes:
 
     canvas.text(MARGIN, 428, "Configuração", 11, bold=True, color=(0.08, 0.31, 0.50))
     configuration = [
+        f"Corpo de prova: {program.specimen_type}",
+        f"Norma/procedimento: {program.standard}",
         f"Limite de carga: {_force(program.force_limit_kn, unit)}",
         f"Posição inicial: {_number(program.initial_position_mm)} mm",
         f"Curso permitido: {_number(program.position_min_mm)} a {_number(program.position_max_mm)} mm",
         f"Ciclos: {program.cycles}",
         f"Aquisição: a cada {_number(program.acquisition_interval_mm)} mm",
         f"Espera antes do retorno: {_number(program.wait_before_decompression_s)} s",
+        f"Aquisicao temporal: a cada {_number(program.acquisition_interval_s)} s",
+        f"Duracao configurada: {format_duration_display(program.duration_h)}",
     ]
     for index, value in enumerate(configuration):
         x = MARGIN + (index % 3) * 257
         y = 409 - (index // 3) * 18
         canvas.text(x, y, value, 8.5, color=(0.16, 0.18, 0.20))
 
-    canvas.text(MARGIN, 360, f"Curva carga × deslocamento ({unit} × mm)", 11, bold=True, color=(0.08, 0.31, 0.50))
-    _draw_graph(canvas, samples, unit, MARGIN + 48, 98, PAGE_WIDTH - 2 * MARGIN - 64, 236)
+    is_traction = program.specimen_type != "compressao"
+    graph_title = f"Carga da tração ({unit}) × tempo" if is_traction else f"Curva carga × deslocamento ({unit} × mm)"
+    canvas.text(MARGIN, 360, graph_title, 11, bold=True, color=(0.08, 0.31, 0.50))
+    _draw_graph(
+        canvas,
+        samples,
+        unit,
+        MARGIN + 48,
+        98,
+        PAGE_WIDTH - 2 * MARGIN - 64,
+        236,
+        is_traction=is_traction,
+    )
     canvas.text(
         MARGIN,
         68,
@@ -167,12 +191,14 @@ def _draw_graph(
     y: float,
     width: float,
     height: float,
+    *,
+    is_traction: bool = False,
 ) -> None:
     canvas.stroke_rect(x, y, width, height, color=(0.55, 0.58, 0.60), width=0.7)
     if not samples:
         canvas.text(x + width / 2, y + height / 2, "Sem aquisições", 9, align="center", color=(0.45, 0.47, 0.49))
         return
-    values_x = [sample.displacement_mm for sample in samples]
+    values_x = [sample.time_s for sample in samples] if is_traction else [sample.displacement_mm for sample in samples]
     values_y = [force_from_kn(sample.force_kn, unit) for sample in samples]
     min_x, max_x = min(values_x), max(values_x)
     min_y, max_y = min(values_y), max(values_y)
@@ -205,7 +231,7 @@ def _draw_graph(
         for sample in samples
     ]
     canvas.polyline(points, color=(0.02, 0.42, 0.72), width=1.3)
-    canvas.text(x + width / 2, y - 29, "Deslocamento (mm)", 7.5, align="center")
+    canvas.text(x + width / 2, y - 29, "Tempo (s)" if is_traction else "Deslocamento (mm)", 7.5, align="center")
     canvas.text(x, y + height + 7, f"Carga ({unit})", 7.5)
 
 

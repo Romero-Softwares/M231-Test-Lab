@@ -1,0 +1,61 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=USB
+ClassGuid={36FC9E60-C465-11CF-8056-444553540000}
+Provider=%ProviderName%
+CatalogFile=M231VirtualUsb.cat
+DriverVer=11/20/2026,0.1.0.2
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir=12
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[SourceDisksFiles]
+M231VirtualUsb.sys=1
+
+[Manufacturer]
+%ProviderName%=Models,NTamd64.10.0
+
+[Models.NTamd64.10.0]
+%DeviceDescription%=M231_Install,Root\M231VirtualUsb
+
+[M231_Install.NT]
+CopyFiles=DriverCopyFiles
+
+; Permite que o processo do emulador, executado pelo usuario logado, envie os
+; IOCTLs de plug-in ao controlador. Sem esta ACL o dispositivo raiz inicia,
+; mas \\.\M231VirtualUsb retorna ERROR_ACCESS_DENIED e nenhum conversor aparece.
+[M231_Install.NT.HW]
+AddReg=M231_DeviceSecurity
+
+[M231_DeviceSecurity]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGW;;;WD)(A;;GR;;;RC)"
+
+[DriverCopyFiles]
+M231VirtualUsb.sys
+
+[M231_Install.NT.Services]
+AddService=M231VirtualUsb,0x00000002,M231_Service
+
+[M231_Service]
+DisplayName=%ServiceDescription%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\M231VirtualUsb.sys
+Dependencies=ucx01000,udecx
+
+[M231_Install.NT.Wdf]
+KmdfService=M231VirtualUsb,M231_Wdf
+
+[M231_Wdf]
+KmdfLibraryVersion=1.15
+
+[Strings]
+ProviderName="Merotec"
+DiskName="M231 Virtual USB Driver"
+DeviceDescription="M231 Virtual USB Host Controller"
+ServiceDescription="M231 Virtual USB Host Controller"
