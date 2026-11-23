@@ -3,12 +3,22 @@ from pathlib import Path
 import unittest
 
 from m231pro.core.reporting import generate_run_report_pdf, report_filename
-from m231pro.core.simulation import Sample, compression_return_template
+from m231pro.core.simulation import (
+    Sample,
+    compression_return_template,
+    traction_pin_template,
+    traction_spring_template,
+)
 from m231pro.core.storage import ResultsRepository
 from m231pro.hardware.backend import LocalMachineBackend, MachineState
 
 
 class TestIntegrationComponents(unittest.TestCase):
+    @staticmethod
+    def _pdf_has_text(content, text):
+        encoded = text.encode("cp1252").hex().upper().encode("ascii")
+        return encoded in content
+
     def test_return_position_moves_to_test_start_at_configured_speed(self):
         machine = LocalMachineBackend(-100.0, 100.0)
         machine.jog(1, 60.0)
@@ -143,6 +153,64 @@ class TestIntegrationComponents(unittest.TestCase):
         self.assertIn(b"/Count 2", content)
         self.assertTrue(content.endswith(b"%%EOF\n"))
         self.assertGreater(len(content), 3000)
+
+    def test_compression_report_uses_displacement_curve_and_compression_fields(self):
+        program = compression_return_template()
+        samples = [
+            Sample(0.0, 0.0, 0.0, 0.0, 1, 0, "inicio", True),
+            Sample(6.0, 1.25, -10.0, -10.0, 1, 1, "compressao", True),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "compressao.pdf"
+            repository = ResultsRepository(Path(directory) / "results.sqlite3")
+            run_id = repository.save_run(program, samples, "local", "concluído")
+            run = repository.get_run(run_id)
+            generate_run_report_pdf(report, run)
+            content = report.read_bytes()
+
+        self.assertTrue(self._pdf_has_text(content, "Compressão"))
+        self.assertTrue(self._pdf_has_text(content, "Curva carga × deslocamento"))
+        self.assertTrue(self._pdf_has_text(content, "Aquisição"))
+        self.assertFalse(self._pdf_has_text(content, "Carga-alvo"))
+
+    def test_pin_traction_report_uses_time_curve_and_astm_fields(self):
+        program = traction_pin_template()
+        samples = [
+            Sample(0.0, 0.0, 0.0, 0.0, 1, 1, "tracao", True),
+            Sample(60.0, 2.0, 0.2, 0.2, 1, 1, "tracao", True),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "tracao-pino.pdf"
+            repository = ResultsRepository(Path(directory) / "results.sqlite3")
+            run_id = repository.save_run(program, samples, "local", "concluído")
+            run = repository.get_run(run_id)
+            generate_run_report_pdf(report, run)
+            content = report.read_bytes()
+
+        self.assertTrue(self._pdf_has_text(content, "Tração de pino"))
+        self.assertTrue(self._pdf_has_text(content, "Curva carga × tempo"))
+        self.assertTrue(self._pdf_has_text(content, "ASTM F606/F606M"))
+        self.assertTrue(self._pdf_has_text(content, "Carga-alvo"))
+        self.assertTrue(self._pdf_has_text(content, "Tempo (s)"))
+
+    def test_spring_traction_report_uses_spring_profile(self):
+        program = traction_spring_template()
+        samples = [
+            Sample(0.0, 0.0, 0.0, 0.0, 1, 1, "tracao", True),
+            Sample(60.0, 1.0, 2.0, 2.0, 1, 1, "tracao", True),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "tracao-mola.pdf"
+            repository = ResultsRepository(Path(directory) / "results.sqlite3")
+            run_id = repository.save_run(program, samples, "local", "concluído")
+            run = repository.get_run(run_id)
+            generate_run_report_pdf(report, run)
+            content = report.read_bytes()
+
+        self.assertTrue(self._pdf_has_text(content, "Tração de mola"))
+        self.assertTrue(self._pdf_has_text(content, "Procedimento configurável"))
+        self.assertTrue(self._pdf_has_text(content, "Rigidez equivalente"))
+        self.assertTrue(self._pdf_has_text(content, "Retorno automático"))
 
 
 if __name__ == "__main__":
